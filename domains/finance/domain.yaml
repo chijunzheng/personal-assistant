@@ -1,0 +1,42 @@
+name: finance
+description: "Transactions, spending queries, statement uploads"
+
+intents:
+  - finance.transaction  # single transaction or batch from a statement
+  - finance.query        # read-only question about spending
+  - finance.budget       # read/write budget targets
+  - finance.subscription # detect recurring charges
+
+storage:
+  type: jsonl
+  path: vault/finance/
+  files:
+    transactions: vault/finance/transactions.jsonl
+    budgets:      vault/finance/budgets.yaml
+    categories:   vault/finance/categories.yaml    # taxonomy
+  schema:
+    transaction:
+      id: sha256                                   # content-hash of statement line; idempotent
+      date: ISO8601
+      amount: number                               # negative = expense, positive = income
+      currency: string                             # CAD | USD | etc.
+      merchant: string                             # raw merchant string
+      merchant_normalized: string                  # cleaned form for grouping
+      category: string                             # from categories.yaml
+      subcategory: string                          # optional
+      source: string                               # which statement/upload
+      raw: string                                  # original line for audit
+      tags: [string]
+      confidence: number                           # 0-1, classifier's confidence
+
+handlers:
+  write: handler.py:write                          # idempotent on id
+  read:  handler.py:read                           # structured query tool
+
+digest:
+  enabled: true
+  cadence: weekly                                  # spending breakdown in weekly digest
+  module: digest.py:summarize
+
+eval:
+  cases: eval/cases.jsonl

@@ -1,0 +1,135 @@
+# Engineered configuration — all six context-engineering decisions ON.
+# Compared head-to-head against configs/baseline.yaml on the same inputs
+# at the same token budget.
+#
+# Retrieval strategy: pure agentic tool calling. No embeddings, no vector DB.
+# The agent navigates the vault using filesystem tools + structural conventions
+# + LLM-driven keyword expansion at query time.
+
+retrieval:
+  strategy: agentic-tool          # NOT embedding-RAG
+  context_token_budget: 6000      # the budget the engineering must fit within
+  max_tool_calls_per_turn: 8      # cap on agent navigation depth per turn
+
+context_engineering:
+
+  # Item 1: Tiered retrieval = ordered tool palette
+  # The agent reads in this order: index → session → targeted vault reads
+  tiered_retrieval: true
+
+  # Item 2: Per-domain shaping
+  # Agent has access to structured-query tools per domain (query_finance,
+  # query_inventory). Without this, finance/inventory queries fall back to
+  # raw text retrieval and the LLM has to sum numbers itself (= hallucination).
+  per_domain_shaping: true
+
+  # Item 3: Recency weighting
+  # When ranking grep matches, the agent's prompt tells it to prefer recent
+  # files. Filenames carry dates, so this is a free signal — no embedding
+  # similarity decay needed.
+  recency_weighting: true
+  recency_half_life_days: 14
+
+  # Item 4: Active session summary
+  # vault/_index/active_session.md holds a compact running summary of the
+  # current session, refreshed each turn. The kernel always loads this first.
+  active_session_summary: true
+
+  # Item 5: Vault index first
+  # vault/_index/INDEX.md is the auto-maintained TOC with topic clusters,
+  # tag map, and synonym hints. Agent ALWAYS reads this before any grep.
+  # This seeds keyword expansion vocabulary for semantic-style queries.
+  vault_index_first: true
+  index_refresh_after_writes: 5
+
+  # Item 6: Backlink expansion
+  # After reading a vault file, agent harvests [[wikilinks]] in it and
+  # opportunistically reads 1-hop neighbors when budget allows. This is the
+  # graph-walk that exploits Obsidian's native link structure.
+  backlink_expansion: true
+  backlink_max_hops: 1
+
+  # Item 7: Suggested actions (proactive layer)
+  # LLM pass over composed digests adds "what should the user notice or
+  # consider?" advice. Without this, digests are pure data dumps. With this,
+  # the system shifts from reporter to advisor.
+  suggested_actions: true
+
+# Agent tool palette
+# The kernel exposes these to claude -p as tools. Domain plugins register
+# their own structured-query tools (query_finance, query_inventory, etc.)
+# which appear here automatically.
+tools:
+  filesystem:
+    - read_file                   # cat any vault file
+    - grep                        # rg over vault with expanded keywords
+    - list_dir                    # ls/glob
+  index:
+    - read_index                  # vault/_index/INDEX.md
+    - read_session                # vault/_index/active_session.md
+  domain:                         # auto-discovered from domains/*/handler.py
+    - query_finance
+    - query_inventory
+  expansion:
+    - expand_keywords             # LLM call: synonyms + related terms
+    - read_backlinks              # follow [[wikilinks]] from a file
+
+classifier:
+  model: claude
+  fallback_to_inbox: true         # ambiguous → vault/_inbox/ for triage
+
+audit:
+  enabled: true
+  format: jsonl
+  rotation: daily
+  path: vault/_audit/
+  # Every audit entry is a single JSONL line with this shape:
+  #   {
+  #     "id": sha256,                           # idempotency
+  #     "ts": ISO8601-with-tz,
+  #     "op": classify | write | read | digest_send | reminder_fire | conflict_resolve,
+  #     "domain": string | "kernel",
+  #     "actor": "kernel.vault" | "domain.<name>" | "proactive",
+  #     "telegram_msg_id": string | null,
+  #     "session_id": string,
+  #     "intent": string | null,                # if classify happened
+  #     "path": string | null,                  # if write/read
+  #     "sha256_after": string | null,          # content hash post-write
+  #     "tokens_in": int | null,                # for token telemetry (9d)
+  #     "tokens_out": int | null,
+  #     "duration_ms": int,
+  #     "config": "default" | "baseline",       # which config produced this
+  #     "outcome": "ok" | "error",
+  #     "error": string | null,
+  #     "preview": string | null                # first ~200 chars of write content
+  #   }
+  fields_required:
+    - id
+    - ts
+    - op
+    - actor
+    - outcome
+    - duration_ms
+    - config
+
+proactive:
+  daily_digest:
+    enabled: true
+    time: "08:00"
+    timezone: "America/Vancouver"
+  weekly_digest:
+    enabled: true
+    day: "Sunday"
+    time: "18:00"
+  reminder_check_interval_min: 5
+  inbox_archive_after_weeks: 4
+
+sync:
+  # See kernel/SYNC.md for the full strategy.
+  write_buffer_min: 30              # Defense 3: agent stays out of files
+                                    # the user has touched in last N minutes
+  conflict_watcher_interval_min: 1  # Defense 4: how often to scan for
+                                    # Drive's "(Conflict ...)" files
+  conflict_auto_merge: true         # Defense 4: engineered config can LLM-merge;
+                                    # baseline only stages + notifies
+  audit_required: true              # Defense 5: no write without audit line

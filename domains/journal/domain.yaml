@@ -1,0 +1,30 @@
+name: journal
+description: "Substantive thoughts, learnings, ideas worth persisting and linking"
+
+intents:
+  - journal.capture       # user dumped a thought worth saving
+  - journal.query         # user is asking what they previously thought/learned
+
+storage:
+  type: markdown
+  path: vault/journal/
+  naming: "{date}-{slug}.md"   # e.g. 2026-04-29-memgpt-tiers.md
+  frontmatter:
+    date: ISO8601
+    tags: [string]
+    links: [path]              # auto-populated wikilinks to related notes
+    source: telegram | manual
+    session_id: string         # ties back to active session
+
+handlers:
+  classify: null               # use kernel default (LLM classifier)
+  write: handler.py:write
+  read:  handler.py:read
+
+digest:
+  enabled: true
+  cadence: weekly
+  module: digest.py:summarize  # "topics you've been thinking about"
+
+eval:
+  cases: eval/cases.jsonl

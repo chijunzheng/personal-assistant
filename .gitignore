@@ -1,0 +1,100 @@
+# Personal Assistant — gitignore
+#
+# Rule: NO personal data ever gets committed.
+# The repo is the *system* (kernel, plugins, configs, docs). The *contents*
+# of the vault stay on the user's local Drive only.
+
+# --- Vault contents (the personal data store) ---
+# Ignore everything under vault/ EXCEPT the sample INDEX file we ship as
+# a reference for what the auto-generated TOC looks like.
+vault/*
+!vault/_index/
+vault/_index/*
+!vault/_index/INDEX.md
+
+# Stage areas — always empty in the repo, populated only at runtime.
+vault/_inbox/
+vault/_audit/
+
+# --- Per-domain runtime data ---
+# These live under vault/<domain>/ which is already covered above, but
+# call them out explicitly so the intent is obvious to readers.
+vault/journal/
+vault/finance/
+vault/inventory/
+vault/reminder/
+vault/fitness/
+
+# --- The user's actual fitness profile ---
+# `domains/fitness/profile.template.yaml` (schema) IS tracked.
+# `vault/fitness/profile.yaml` (filled-in personal data) is NOT.
+# Already covered by `vault/*` above; called out explicitly for clarity.
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+credentials/
+**/anthropic_api_key*
+**/telegram_bot_token*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# --- Testing & coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- launchd run state ---
+infra/launchd/*.log
+infra/launchd/*.pid
+/tmp/personal-assistant.lock
+
+# --- Eval results (large + frequently regenerated) ---
+eval/results/
+docs/eval-progression.md

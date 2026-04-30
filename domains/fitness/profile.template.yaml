@@ -1,0 +1,58 @@
+# Fitness profile template.
+#
+# On first run, the kernel copies this file to vault/fitness/profile.yaml.
+# Fill in your real values there — NOT here. (This file is the schema and
+# stays in the plugin as a reference.)
+#
+# Every field marked TODO must be filled in before fitness.workout_plan or
+# fitness.nutrition_plan will produce useful output. The agent's prompt
+# instructs it to refuse to generate plans against a profile with TODO holes.
+
+# --- demographic ---
+sex: TODO                          # m | f | other
+date_of_birth: TODO                # ISO8601, e.g. 1995-04-15
+height_cm: TODO                    # number
+weight_kg: TODO                    # number — most recent self-report
+
+# --- goal ---
+goal: TODO                         # cut | maintain | recomp | bulk | performance | rehab
+target_weight_kg: TODO             # number, or set to current weight if maintaining
+target_date: null                  # ISO8601 or null. If set, plans pace toward this date.
+
+# --- context ---
+activity_level: moderate           # sedentary | light | moderate | active | very_active
+weekly_training_days: 4            # how many days/wk you can train
+
+equipment_available:               # what you have access to
+  - bw                             # bodyweight
+  # - bb                           # barbell
+  # - db                           # dumbbells
+  # - cable
+  # - kettlebell
+  # - treadmill
+  # - bike
+  # - rower
+
+dietary_restrictions: []           # e.g. [lactose-free, vegetarian, halal]
+allergies: []                      # e.g. [shellfish]
+
+injuries_active: []                # currently flaring up; affects today's plans
+injuries_history: []               # past, may inform programming
+
+preferences:
+  enjoys: []                       # e.g. [lifting, running]
+  avoids: []                       # e.g. [plyo, long_steady_state_cardio]
+
+# --- macros ---
+# Leave these null and the handler will compute on first plan request using
+# Mifflin–St Jeor + activity multiplier + goal-specific deficit/surplus.
+# Override only if you have a coach-prescribed number you trust more.
+target_calories_kcal: null
+target_protein_g: null
+target_carbs_g: null
+target_fat_g: null
+
+# --- plan cadence ---
+plan_cadence: daily                # daily | weekly
+                                   # daily = generate a new plan each day on demand
+                                   # weekly = generate one plan covering 7 days

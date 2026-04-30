@@ -1,0 +1,43 @@
+name: inventory
+description: "Household items in fridge, pantry, storage. State + event log."
+
+intents:
+  - inventory.add        # "bought 2 milks at Costco"
+  - inventory.consume    # "just used the last battery"
+  - inventory.adjust     # "actually I miscounted, only 3 eggs left"
+  - inventory.query      # "do I still have AAA batteries?"
+  - inventory.list_low   # "what's running low?"
+
+storage:
+  type: hybrid
+  state_file: vault/inventory/state.yaml         # canonical "what I have now"
+  event_log:  vault/inventory/events.jsonl       # append-only history
+  schema:
+    state_entry:
+      item: string                               # canonical item name
+      quantity: number
+      unit: string                               # "count", "g", "ml", etc.
+      location: string                           # "fridge" | "pantry" | "storage" | "freezer"
+      last_seen: ISO8601
+      low_threshold: number                      # when quantity drops below, flag for digest
+      tags: [string]
+    event:
+      id: sha256                                 # idempotency key
+      type: bought | consumed | adjusted
+      item: string
+      quantity_delta: number                     # signed
+      timestamp: ISO8601
+      source: telegram | manual | digest_response
+      context: string                            # raw user phrase
+
+handlers:
+  write: handler.py:write                        # appends event, recomputes state
+  read:  handler.py:read
+
+digest:
+  enabled: true
+  cadence: daily                                 # low-stock alerts in daily digest
+  module: digest.py:summarize
+
+eval:
+  cases: eval/cases.jsonl

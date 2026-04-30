@@ -1,0 +1,65 @@
+# Vanilla baseline — all six context-engineering decisions OFF.
+# This is what most people would build first: an agent with raw filesystem
+# access and nothing else. Beating this convincingly is the eval claim.
+#
+# IMPORTANT: same retrieval *strategy* (agentic), same token budget. The
+# only difference is the engineering layer. This isolates the variable.
+
+retrieval:
+  strategy: agentic-tool          # SAME strategy — fairness
+  context_token_budget: 6000      # SAME budget — fairness
+  max_tool_calls_per_turn: 8      # SAME — fairness
+
+context_engineering:
+  tiered_retrieval: false         # → no ordered tool palette; agent improvises
+  per_domain_shaping: false       # → no structured query tools; finance/inventory
+                                  #   queries answered by raw text retrieval +
+                                  #   LLM-summed numbers (= hallucination risk)
+  recency_weighting: false        # → no recency hint in prompt
+  active_session_summary: false   # → no session memory across turns
+  vault_index_first: false        # → no INDEX.md; no synonym seed for expansion
+  backlink_expansion: false       # → no graph walk
+  suggested_actions: false        # → digests are pure data dumps, no LLM advice pass
+
+tools:
+  filesystem:
+    - read_file
+    - grep
+    - list_dir
+  # No index tools, no domain tools, no expansion tools. Just filesystem.
+
+classifier:
+  model: claude
+  fallback_to_inbox: true         # baseline still classifies — otherwise it
+                                  # can't even route to a domain. Removing the
+                                  # classifier would compare engineered system
+                                  # vs broken system (strawman).
+
+audit:
+  enabled: true                   # audit ON in both configs so we can debug
+  format: jsonl
+  rotation: daily
+  path: vault/_audit/
+
+proactive:
+  # Same scheduling — fairness. The DIFFERENCE is suggested_actions OFF above,
+  # which means baseline digests are templated data dumps, not LLM-advised.
+  daily_digest:
+    enabled: true
+    time: "08:00"
+    timezone: "America/Vancouver"
+  weekly_digest:
+    enabled: true
+    day: "Sunday"
+    time: "18:00"
+  reminder_check_interval_min: 5
+  inbox_archive_after_weeks: 4
+
+sync:
+  # Same defenses 1, 2, 3, 5 — they're correctness, not engineering.
+  # The DIFFERENCE: conflict_auto_merge OFF in baseline. Conflict watcher
+  # still detects + stages + notifies, but does not LLM-merge.
+  write_buffer_min: 30
+  conflict_watcher_interval_min: 1
+  conflict_auto_merge: false        # baseline: no LLM merging of conflicts
+  audit_required: true

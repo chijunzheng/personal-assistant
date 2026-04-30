@@ -1,0 +1,200 @@
+name: fitness
+description: "Workout + nutrition tracker with adaptive plan generation. The
+  'learn over time' loop is in-context: every plan request reads recent logs
+  + profile + journal cross-refs, no fine-tuning, no embeddings."
+
+intents:
+  - fitness.workout_log       # "did 5x5 squats at 100kg, 3x10 rdl, 20min bike"
+  - fitness.workout_plan      # "what should I train today?"
+  - fitness.meal_log          # "had 3 eggs and 2 slices toast for breakfast"
+  - fitness.nutrition_plan    # "what should I eat today / for the week?"
+  - fitness.metric_log        # "weighed in at 78.4 this morning"
+  - fitness.profile_update    # "I want to switch to a cut"
+  - fitness.query             # "how often did I train last month?"
+
+storage:
+  type: hybrid                # YAML state + JSONL event logs + markdown plans
+  path: vault/fitness/
+  files:
+    profile:        vault/fitness/profile.yaml          # canonical user state
+    profile_events: vault/fitness/profile_events.jsonl  # append-only audit of profile edits
+    workouts:       vault/fitness/workouts.jsonl        # append-only workout log
+    meals:          vault/fitness/meals.jsonl           # append-only meal log
+    metrics:        vault/fitness/metrics.jsonl         # weight, HR, sleep, mood, etc.
+    plans:          vault/fitness/plans/                # generated plans (markdown)
+
+  schema:
+
+    profile:
+      # Mutable canonical state — recomputable from profile_events.jsonl on
+      # demand. profile.yaml itself is the convenience read; the event log is
+      # the source of truth (mirrors inventory's pattern).
+      kind: yaml
+      fields:
+        # demographic
+        sex: enum [m, f, other]
+        date_of_birth: ISO8601
+        height_cm: number
+        weight_kg: number                     # most-recent self-report; metrics.jsonl is the time series
+        # goal
+        goal: enum [cut, maintain, recomp, bulk, performance, rehab]
+        target_weight_kg: number
+        target_date: ISO8601 | null
+        # context
+        activity_level: enum [sedentary, light, moderate, active, very_active]
+        weekly_training_days: integer
+        equipment_available: [string]         # e.g. ["bw", "bb", "db", "cable", "kettlebell", "treadmill"]
+        dietary_restrictions: [string]        # ["lactose-free", "halal", ...]
+        allergies: [string]
+        injuries_active: [string]             # currently flaring up
+        injuries_history: [string]            # past, may inform programming
+        preferences:
+          enjoys: [string]                    # ["lifting", "running"]
+          avoids: [string]                    # ["plyo", "long cardio"]
+        # macros (user-set OR computed by handler from goal + body comp)
+        target_calories_kcal: integer | null
+        target_protein_g: integer | null
+        target_carbs_g: integer | null
+        target_fat_g: integer | null
+        # plan cadence
+        plan_cadence: enum [daily, weekly]    # how often a fresh plan is generated
+
+    profile_event:
+      id: sha256                              # idempotency
+      ts: ISO8601
+      field: string                           # dotted path, e.g. "preferences.avoids"
+      old_value: any
+      new_value: any
+      source: telegram | manual | digest_response
+
+    workout:
+      id: sha256                              # idempotency: hash(date|exercises|notes)
+      date: ISO8601
+      type: enum [strength, cardio, mobility, sport, mixed, rest]
+      duration_min: integer
+      intensity: enum [easy, moderate, hard, max]
+      exercises:
+        - name: string                        # canonical exercise name (normalized by handler)
+          sets: integer | null
+          reps: integer | null
+          weight_kg: number | null
+          distance_km: number | null
+          duration_min: number | null
+          notes: string | null                # form cues, RPE, etc.
+      rpe: integer | null                     # 1-10 session-level perceived exertion
+      session_notes: string | null            # subjective: how it felt
+      plan_id: string | null                  # links back to the plan that prescribed this (if any)
+      source: telegram | manual | wearable
+      tags: [string]                          # ["pull", "deload", "bench-pr", ...]
+
+    meal:
+      id: sha256                              # idempotency: hash(ts|items)
+      ts: ISO8601
+      meal_type: enum [breakfast, lunch, dinner, snack, drink]
+      items:
+        - name: string
+          quantity: number
+          unit: string                        # "g" | "ml" | "count" | "serving"
+          calories_kcal: number
+          protein_g: number
+          carbs_g: number
+          fat_g: number
+          confidence: number                  # 0-1 how sure the LLM was about portion size
+      total_kcal: number
+      total_protein_g: number
+      total_carbs_g: number
+      total_fat_g: number
+      photo_path: string | null               # vault/fitness/meal_photos/{date}-{id}.jpg
+      source: telegram | manual
+      notes: string | null
+
+    metric:
+      id: sha256
+      ts: ISO8601
+      kind: enum [weight, body_fat_pct, resting_hr, sleep_hours, mood, soreness, energy, hrv, vo2max]
+      value: number
+      unit: string                            # "kg" | "%" | "bpm" | "h" | "1-10" | etc.
+      source: telegram | manual | wearable
+      notes: string | null
+
+    plan:
+      # Generated markdown plan. Frontmatter records EVERY input the agent saw
+      # so eval can audit grounding (engineered should cite real recent logs;
+      # baseline often cites nothing).
+      kind: markdown
+      naming: "{date_for}-{kind}-{slug}.md"   # e.g. 2026-04-29-workout-pull-day.md
+      frontmatter:
+        plan_id: sha256                       # of plan content
+        kind: enum [workout, nutrition, weekly]
+        date_generated: ISO8601
+        date_for: ISO8601                     # the day(s) the plan covers
+        based_on:                             # the agentic context audit trail
+          profile_snapshot_sha256: string     # ties plan to the profile state at gen time
+          recent_workouts: [id]               # workout ids the agent read
+          recent_meals: [id]                  # meal ids the agent read
+          recent_metrics: [id]                # metric ids the agent read
+          journal_cross_refs: [path]          # [[wikilinks]] to journal entries the agent considered
+        compliance_score: number | null       # filled in retrospectively when logs match plan
+        tags: [string]
+        links: [path]                         # cross-domain wikilinks
+
+handlers:
+  classify: null                              # use kernel default LLM classifier
+  write: handler.py:write                     # idempotent on id
+  read:  handler.py:read
+
+# Structured query tool exposed to the agent when per_domain_shaping=true.
+# Without this (baseline), aggregate queries fall back to raw grep + LLM
+# arithmetic over JSONL — which is the exact hallucination surface the
+# eval is designed to expose.
+query_tool:
+  name: query_fitness
+  signatures:
+    - "query_fitness(kind='workouts', date_range=..., type=..., agg='count'|'list'|'volume')"
+    - "query_fitness(kind='meals', date_range=..., agg='sum'|'avg', macro=..., meal_type=...)"
+    - "query_fitness(kind='metrics', metric_kind=..., date_range=..., agg='trend'|'last'|'avg')"
+    - "query_fitness(kind='plans', date_range=..., plan_kind=...)"
+    - "query_fitness(kind='compliance', plan_id=..., compare_to_logs=true)"
+    - "query_fitness(kind='profile')"
+
+digest:
+  enabled: true
+  daily:
+    enabled: true
+    contents:
+      - todays_planned_workout                # surfaces today's plan if one exists
+      - calorie_pacing                        # vs target, with current intake
+      - protein_pacing                        # vs target
+      - body_metric_alerts                    # weigh-in deltas crossing target_weight thresholds
+  weekly:
+    enabled: true
+    contents:
+      - weekly_workout_summary                # sessions, volume, frequency
+      - calorie_avg_vs_target
+      - macro_avg_vs_target
+      - body_metric_trend                     # weight trajectory vs target_date pace
+      - compliance_score                      # plans followed / plans generated
+      - suggested_actions                     # gated on configs/default.yaml: suggested_actions=true
+  module: digest.py:summarize
+
+# The "learn to optimize over time" mechanism.
+# Per CLAUDE.md, plugins NEVER import each other. Cross-domain signal flows
+# through kernel.retrieval at plan-generation time. This block declares
+# intent so the kernel knows which domains to seed grep with for fitness
+# plan turns.
+cross_domain_signals:
+  read_via: kernel.retrieval                  # never direct file imports
+  consult:
+    - domain: journal
+      purpose: "subjective signals (energy, mood, sleep, soreness, life-stress mentions)"
+      lookback_days: 14
+    - domain: finance
+      purpose: "grocery / dining-out spending as a coarse signal of nutrition adherence"
+      lookback_days: 14
+      optional: true                          # gracefully degrade if finance has no recent data
+    - domain: inventory
+      purpose: "what food/supplements are actually in the pantry — plans should respect this"
+      lookback_days: null                     # current state, not time-windowed
+
+eval:
+  cases: eval/cases.jsonl

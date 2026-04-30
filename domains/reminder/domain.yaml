@@ -1,0 +1,49 @@
+name: reminder
+description: "Scheduled and state-derived reminders. Unified dispatcher."
+
+intents:
+  - reminder.add        # "remind me to call mom on Sunday at 6pm"
+  - reminder.add_when   # "remind me when I run out of AAA batteries"
+  - reminder.list       # "what reminders do I have?"
+  - reminder.cancel     # "cancel the call mom reminder"
+
+storage:
+  type: jsonl
+  path: vault/reminder/
+  files:
+    events: vault/reminder/events.jsonl
+  schema:
+    reminder:
+      id: sha256                              # idempotency key
+      created_at: ISO8601
+      message: string                         # what to ping the user with
+      kind: scheduled | state_derived
+      # for kind=scheduled:
+      fire_at: ISO8601                        # next firing time
+      recurrence: null | "daily" | "weekly" | "monthly" | cron-expr
+      # for kind=state_derived:
+      condition: string                       # vault query expression that returns bool
+      check_interval_min: number              # how often to re-evaluate
+      # common:
+      status: pending | fired | cancelled
+      fired_at: ISO8601                       # set when fired
+      source: telegram | manual | digest_response
+      domain_origin: string                   # which domain spawned this (e.g., "inventory")
+
+handlers:
+  write: handler.py:write
+  read:  handler.py:read
+
+# This domain does NOT contribute to digests directly.
+# Instead, it has a dedicated cron job invoked by the kernel.
+digest:
+  enabled: false
+
+# Special: reminder is the only domain with a kernel-level cron contract.
+# The kernel runs `proactive.py --task check-reminders` every 5 minutes;
+# this domain's handler.read("due") is what gets invoked.
+proactive:
+  cron_check_interval_min: 5
+
+eval:
+  cases: eval/cases.jsonl
