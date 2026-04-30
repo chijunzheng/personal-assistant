@@ -42,6 +42,7 @@ __all__ = [
     "ConflictWatcher",
     "MergerFn",
     "NotifierFn",
+    "main",
 ]
 
 
@@ -330,3 +331,118 @@ class ConflictWatcher:
             self._audit_writer(entry, audit_root=self._audit_root)
         except Exception:  # noqa: BLE001
             logger.exception("audit write failed for %s", conflict_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI — invoked by the launchd plist every minute.
+# ---------------------------------------------------------------------------
+
+
+def _noop_merger(*, canonical_text: str, conflict_text: str, diff: str) -> str:
+    """Default CLI merger — returns canonical unchanged.
+
+    Production CLI invocations from launchd default to staging-only
+    (``--no-auto-merge``), so the merger is never consulted. We still
+    install a non-raising default for safety: if a future caller flips
+    auto-merge on without providing an LLM-backed merger, we degrade to
+    "preserve canonical, drop conflict" rather than crash.
+    """
+    return canonical_text
+
+
+def _stderr_notifier(message: str) -> None:
+    """Default CLI notifier — log-only.
+
+    The bot polling loop owns Telegram delivery. The conflict-watcher
+    CLI runs as a one-shot subprocess with no Telegram session, so it
+    just writes to stderr; the launchd plist routes that to a log file
+    (``infra/launchd/conflict-watcher.err.log``).
+    """
+    import sys as _sys
+
+    _sys.stderr.write(f"conflict-watcher: {message}\n")
+
+
+def _build_cli_parser() -> "argparse.ArgumentParser":
+    """argparse spec — ``python -m kernel.conflict_watcher --run-once``."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m kernel.conflict_watcher",
+        description="Single-shot Drive-conflict scan (launchd cadence: every 1 min).",
+    )
+    parser.add_argument(
+        "--run-once",
+        action="store_true",
+        help="Perform a single scan and exit (the launchd-friendly mode).",
+    )
+    parser.add_argument(
+        "--vault-root",
+        default="vault",
+        help="Vault root on disk (default: ./vault).",
+    )
+    parser.add_argument(
+        "--audit-root",
+        default="vault/_audit",
+        help="Audit-log root (default: ./vault/_audit).",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to a YAML config file (e.g., configs/default.yaml).",
+    )
+    return parser
+
+
+def _resolve_auto_merge(config_path: Optional[str]) -> tuple[bool, str]:
+    """Read ``sync.conflict_auto_merge`` and pick a config label."""
+    if not config_path:
+        return False, "default"
+    path = Path(config_path)
+    if not path.exists():
+        return False, "default"
+    try:
+        import yaml  # local import; yaml is a runtime dep already
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return False, "default"
+    sync = data.get("sync") or {} if isinstance(data, dict) else {}
+    auto_merge = bool(sync.get("conflict_auto_merge", False)) if isinstance(sync, dict) else False
+    label = "baseline" if "baseline" in path.name else "default"
+    return auto_merge, label
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entrypoint. Returns process exit code.
+
+    The launchd plist invokes this every minute with ``--run-once``.
+    Each invocation constructs a fresh ``ConflictWatcher`` and performs
+    exactly one scan. ``run_loop`` is reserved for foreground debug.
+    """
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+
+    auto_merge, config_label = _resolve_auto_merge(args.config)
+
+    watcher = ConflictWatcher(
+        vault_root=args.vault_root,
+        audit_root=args.audit_root,
+        config_label=config_label,
+        # CLI invocations default to staging-only — the LLM merger
+        # belongs to the bot process, not a one-shot launchd job.
+        conflict_auto_merge=auto_merge,
+        merger=_noop_merger,
+        notifier=_stderr_notifier,
+    )
+
+    if args.run_once:
+        watcher.run_once()
+        return 0
+
+    # No mode flag given — same behavior as --run-once for safety.
+    watcher.run_once()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

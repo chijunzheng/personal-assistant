@@ -271,3 +271,52 @@ def test_audit_records_error_when_merger_raises(tmp_path: Path) -> None:
     # Canonical and conflict files are both still present — nothing was lost.
     assert canonical.exists()
     assert conflict.exists()
+
+
+# ---------------------------------------------------------------------------
+# CLI: ``python -m kernel.conflict_watcher --run-once``
+# ---------------------------------------------------------------------------
+
+
+def test_cli_run_once_executes_one_scan_and_exits(tmp_path: Path) -> None:
+    """``--run-once`` must perform a single ``run_once`` scan and exit cleanly.
+
+    launchd schedules the cadence; we never want this CLI invocation to
+    fall into a long-running ``run_loop``.
+    """
+    from kernel.conflict_watcher import main
+
+    vault = tmp_path / "vault"
+    audit = tmp_path / "audit"
+    vault.mkdir(parents=True, exist_ok=True)
+
+    # Dropping a conflict file gives the scan something to do without
+    # any merger or notifier wiring (we go down the staging branch).
+    canonical = vault / "journal" / "2026-04-29.md"
+    conflict = vault / "journal" / "2026-04-29 (Conflict 2026-04-29 18-21).md"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text("# canonical\n", encoding="utf-8")
+    conflict.write_text("# canonical\nphone\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--run-once",
+            "--vault-root",
+            str(vault),
+            "--audit-root",
+            str(audit),
+        ]
+    )
+
+    assert exit_code == 0
+    # The conflict was staged into _inbox/_conflicts/.
+    staged = list((vault / "_inbox" / "_conflicts").rglob("*.md"))
+    assert len(staged) == 1
+
+
+def test_cli_rejects_unknown_args(tmp_path: Path) -> None:
+    """Argparse must reject malformed flags so misconfigured plists fail fast."""
+    from kernel.conflict_watcher import main
+
+    with pytest.raises(SystemExit):
+        main(["--not-a-real-flag"])
