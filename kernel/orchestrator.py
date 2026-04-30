@@ -175,6 +175,8 @@ class Orchestrator:
         finance_query_parser: Optional[Callable[[str], dict]] = None,
         inventory_extractor: Optional[Callable[[str, str], dict]] = None,
         inventory_query_parser: Optional[Callable[[str], dict]] = None,
+        fitness_extractor: Optional[Callable[[str, str], dict]] = None,
+        fitness_query_parser: Optional[Callable[[str], dict]] = None,
     ) -> None:
         self._lock = lock or SingleInstanceLock(DEFAULT_LOCK_PATH)
         self._audit_root = Path(audit_root)
@@ -202,6 +204,11 @@ class Orchestrator:
         # LLM-backed query parser actually runs during integration tests.
         self._inventory_extractor = inventory_extractor
         self._inventory_query_parser = inventory_query_parser
+        # Pluggable fitness hooks — same pattern again. The extractor is
+        # called with ``(message, intent)`` because the same plugin handles
+        # four logging intents with very different output shapes.
+        self._fitness_extractor = fitness_extractor
+        self._fitness_query_parser = fitness_query_parser
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""
@@ -227,6 +234,9 @@ class Orchestrator:
         # finance.transaction  -> finance write (extract + append)
         # inventory.{add,consume,adjust} -> inventory write (event log + state)
         # inventory.{query,list_low}     -> inventory read (query_inventory)
+        # fitness.{workout_log,meal_log,metric_log,profile_update}
+        #                      -> fitness write (logging surface, issue #7)
+        # fitness.query        -> fitness read (query_fitness)
         # everything else      -> generic echo (issue #1 fallback)
         if intent == "journal.query":
             return self._handle_journal_query(
@@ -265,6 +275,25 @@ class Orchestrator:
             )
         if intent in ("inventory.query", "inventory.list_low"):
             return self._handle_inventory_read(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent in (
+            "fitness.workout_log",
+            "fitness.meal_log",
+            "fitness.metric_log",
+            "fitness.profile_update",
+        ):
+            return self._handle_fitness_write(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent == "fitness.query":
+            return self._handle_fitness_query(
                 intent=intent,
                 message=message,
                 started_ts=started_ts,
@@ -835,6 +864,179 @@ class Orchestrator:
         if outcome == "error":
             return OrchestratorReply(
                 text="Sorry — something went wrong reading inventory.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=reply_text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_fitness_write(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch fitness logging intents to the fitness plugin's write path.
+
+        Wires:
+          1. ``domains.fitness.handler.write`` -> appends the right JSONL
+             (workouts / meals / metrics) and (for metric/profile updates)
+             may rewrite ``profile.yaml`` + log a ``profile_event``.
+          2. Audit-log a ``write`` op with ``domain=fitness`` and the path.
+          3. Trigger the every-5-writes index refresh on a successful append.
+          4. Reply with a brief confirmation the user can verify.
+
+        Plan generation (``fitness.workout_plan`` / ``fitness.nutrition_plan``)
+        is NOT routed here — that's issue #8.
+        """
+        # Lazy import keeps the kernel decoupled from plugin compile-time.
+        from domains.fitness.handler import write as fitness_write
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        path: Optional[Path] = None
+        appended = False
+        row_id: Optional[str] = None
+        try:
+            result = fitness_write(
+                intent=intent,
+                message=message,
+                session=session,
+                vault_root=self._vault_root,
+                clock=self._clock,
+                extractor=self._fitness_extractor,
+                invoker=self._invoker,
+            )
+            path = result.path
+            appended = result.appended
+            row_id = result.row_id
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "write",
+            "actor": "kernel.orchestrator",
+            "domain": "fitness",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "appended": 1 if appended else 0,
+            "skipped": 0 if appended else 1,
+        }
+        if path is not None:
+            entry["path"] = str(path)
+        if row_id is not None:
+            entry["row_id"] = row_id
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong saving that fitness event.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        # One-line note about the fitness change for the running session.
+        action = {
+            "fitness.workout_log": "workout logged",
+            "fitness.meal_log": "meal logged",
+            "fitness.metric_log": "metric logged",
+            "fitness.profile_update": "profile updated",
+        }.get(intent, intent)
+        session_update(
+            session,
+            f"fitness: {action}",
+            vault_root=self._vault_root,
+            clock=self._clock,
+        )
+
+        # Bump the writes-since-refresh counter only when a new row landed.
+        if appended:
+            self._maybe_refresh_index(started_ts=started_ts)
+
+        if not appended:
+            text = "Already on file — fitness event unchanged."
+        else:
+            text = f"Logged ({intent.split('.')[-1]})."
+        return OrchestratorReply(
+            text=text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_fitness_query(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``fitness.query`` to the fitness plugin's read path.
+
+        The fitness read does its own structured aggregation via
+        ``query_fitness`` (no retrieval bundle is needed for a numeric
+        answer). The audit entry records the intent + outcome.
+        """
+        from domains.fitness.handler import read as fitness_read
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        reply_text = ""
+        try:
+            reply_text = fitness_read(
+                intent=intent,
+                query=message,
+                vault_root=self._vault_root,
+                query_parser=self._fitness_query_parser,
+                invoker=self._invoker,
+            )
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "fitness",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong reading from your fitness log.",
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,
