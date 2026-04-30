@@ -173,6 +173,8 @@ class Orchestrator:
         index_refresh: Optional[Callable[..., object]] = None,
         finance_extractor: Optional[Callable[[str], list]] = None,
         finance_query_parser: Optional[Callable[[str], dict]] = None,
+        inventory_extractor: Optional[Callable[[str, str], dict]] = None,
+        inventory_query_parser: Optional[Callable[[str], dict]] = None,
     ) -> None:
         self._lock = lock or SingleInstanceLock(DEFAULT_LOCK_PATH)
         self._audit_root = Path(audit_root)
@@ -195,6 +197,11 @@ class Orchestrator:
         # these as ``None`` and the handler shells to ``claude_runner``.
         self._finance_extractor = finance_extractor
         self._finance_query_parser = finance_query_parser
+        # Pluggable inventory hooks — same pattern as finance: tests inject
+        # deterministic stand-ins so neither the LLM-backed extractor nor the
+        # LLM-backed query parser actually runs during integration tests.
+        self._inventory_extractor = inventory_extractor
+        self._inventory_query_parser = inventory_query_parser
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""
@@ -214,11 +221,13 @@ class Orchestrator:
         intent = self._classify(message, started_ts)
 
         # Step 2: dispatch.
-        # journal.query     -> journal read (retrieval + LLM)
-        # journal.*         -> journal write (capture path)
-        # finance.query     -> finance read (structured query_finance)
-        # finance.transaction -> finance write (extract + append)
-        # everything else   -> generic echo (issue #1 fallback)
+        # journal.query        -> journal read (retrieval + LLM)
+        # journal.*            -> journal write (capture path)
+        # finance.query        -> finance read (structured query_finance)
+        # finance.transaction  -> finance write (extract + append)
+        # inventory.{add,consume,adjust} -> inventory write (event log + state)
+        # inventory.{query,list_low}     -> inventory read (query_inventory)
+        # everything else      -> generic echo (issue #1 fallback)
         if intent == "journal.query":
             return self._handle_journal_query(
                 intent=intent,
@@ -242,6 +251,20 @@ class Orchestrator:
             )
         if intent == "finance.transaction":
             return self._handle_finance_transaction(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent in ("inventory.add", "inventory.consume", "inventory.adjust"):
+            return self._handle_inventory_write(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent in ("inventory.query", "inventory.list_low"):
+            return self._handle_inventory_read(
                 intent=intent,
                 message=message,
                 started_ts=started_ts,
@@ -622,6 +645,196 @@ class Orchestrator:
         if outcome == "error":
             return OrchestratorReply(
                 text="Sorry — something went wrong querying your transactions.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=reply_text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_inventory_write(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``inventory.{add,consume,adjust}`` to the inventory write path.
+
+        Wires:
+          1. ``domains.inventory.handler.write`` -> appends events.jsonl +
+             recomputes state.yaml
+          2. Audit-log a ``write`` op with ``domain=inventory`` and the
+             events JSONL path
+          3. Trigger the every-5-writes index refresh on a successful append
+          4. Reply with a brief confirmation the user can verify against state
+        """
+        # Lazy import keeps the kernel decoupled from plugin compile-time.
+        from domains.inventory.handler import write as inventory_write
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        path: Optional[Path] = None
+        appended = False
+        item: Optional[str] = None
+        delta: float = 0.0
+        try:
+            result = inventory_write(
+                intent=intent,
+                message=message,
+                session=session,
+                vault_root=self._vault_root,
+                clock=self._clock,
+                extractor=self._inventory_extractor,
+                invoker=self._invoker,
+            )
+            path = result.path
+            appended = result.appended
+            item = result.item
+            delta = result.quantity_delta
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "write",
+            "actor": "kernel.orchestrator",
+            "domain": "inventory",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "appended": 1 if appended else 0,
+            "skipped": 0 if appended else 1,
+        }
+        if path is not None:
+            entry["path"] = str(path)
+        if item is not None:
+            entry["item"] = item
+            entry["quantity_delta"] = delta
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong updating inventory.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        # One-line note about the inventory change for the running session.
+        action = {
+            "inventory.add": "added",
+            "inventory.consume": "consumed",
+            "inventory.adjust": "adjusted",
+        }.get(intent, intent)
+        session_update(
+            session,
+            f"inventory: {action} {item} (delta={delta})",
+            vault_root=self._vault_root,
+            clock=self._clock,
+        )
+
+        # Bump the writes-since-refresh counter only when a new event landed.
+        if appended:
+            self._maybe_refresh_index(started_ts=started_ts)
+
+        if not appended:
+            text = (
+                f"Already on file — inventory unchanged ({item})."
+            )
+        else:
+            sign = "+" if delta >= 0 else ""
+            text = f"Updated inventory: {item} {sign}{delta}."
+        return OrchestratorReply(
+            text=text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_inventory_read(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``inventory.query`` / ``inventory.list_low`` to the read path.
+
+        The read does its own structured state lookup (no retrieval bundle
+        is needed for a numeric / list answer). The audit entry records the
+        canonical state.yaml path so the user can reconstruct the answer
+        offline.
+        """
+        from domains.inventory.handler import read as inventory_read
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        reply_text = ""
+        mode: Optional[str] = None
+        item: Optional[str] = None
+        count: float = 0
+        try:
+            result = inventory_read(
+                intent=intent,
+                query=message,
+                vault_root=self._vault_root,
+                query_parser=self._inventory_query_parser,
+                invoker=self._invoker,
+            )
+            reply_text = result.reply_text
+            mode = result.mode
+            item = result.item
+            count = result.count
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        state_path = self._vault_root / "inventory" / "state.yaml"
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "inventory",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "match_count": count,
+            "path": str(state_path),
+        }
+        if mode is not None:
+            entry["mode"] = mode
+        if item:
+            entry["item"] = item
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong reading inventory.",
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,
