@@ -511,6 +511,10 @@ class Orchestrator:
             "paths": [str(p) for p in paths],
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            # Issue #10: bundle telemetry — these are what the eval harness
+            # aggregates per turn to chart engineered-vs-baseline divergence.
+            "tokens_in_context_bundle": int(getattr(bundle, "tokens_estimate", 0)),
+            "flags": dict(getattr(bundle, "flags", {})),
         }
         if error_message is not None:
             entry["error"] = error_message
