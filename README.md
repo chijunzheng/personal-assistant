@@ -77,13 +77,16 @@ these eight bits ON yields measurable quality gains at fixed token budget.
 | 4 | `kernel/SYNC.md` | Drive concurrency strategy — five layered defenses |
 | 5 | `kernel/PROACTIVE.md` | Digests, reminders, suggested-actions LLM pass |
 | 6 | `domains/README.md` | Plugin contract — how to add a new use case |
-| 7 | `IMPLEMENTATION.md` | Day-by-day build plan from kernel skeleton to portfolio v1 |
+| 7 | [GitHub issues](https://github.com/chijunzheng/personal-assistant/issues) | Execution queue — pick the next issue whose blockers are all closed |
 | 8 | `configs/default.yaml`, `configs/baseline.yaml` | The eval matrix encoded as YAML |
 
 ## Status
 
 **Design phase complete.** Twelve foundational decisions locked, all artifacts
-in place. Ready for Day 1 implementation per `IMPLEMENTATION.md`.
+in place. Implementation queue lives at
+[GitHub issues](https://github.com/chijunzheng/personal-assistant/issues) —
+17 vertical-slice issues in dependency order. The first issue (#1, Telegram
+echo tracer) builds `kernel/vault.py`'s `atomic_write` plus the Telegram
++ `claude -p` integration as one end-to-end smoke test.
 
-No code yet — design and configs only. Implementation begins with
-`kernel/vault.py` (atomic_write primitive).
+No code yet — design and configs only.

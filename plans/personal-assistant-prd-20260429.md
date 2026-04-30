@@ -3,9 +3,11 @@
 **Date:** 2026-04-29
 **Status:** Design phase complete; ready for implementation
 **Source:** Multi-turn grilling session that produced the artifacts in
-`README.md`, `CLAUDE.md`, `IMPLEMENTATION.md`, `kernel/*.md`,
+`README.md`, `CLAUDE.md`, `kernel/*.md`,
 `domains/*/domain.yaml`, `configs/{default,baseline}.yaml`, and
-`eval/seed_queries/00-jason-seed-queries.md`.
+`eval/seed_queries/00-jason-seed-queries.md`. The execution queue derived
+from this PRD lives as 17 GitHub issues at
+https://github.com/chijunzheng/personal-assistant/issues.
 
 ---
 
@@ -399,14 +401,17 @@ invocation in this repo and treated as binding.
 
 ### Implementation sequencing
 
-`IMPLEMENTATION.md` lays out a 10-day build plan in dependency order, with
-**every milestone as a working slice** rather than a half-built component.
-Day 1-2 is a vertical slice (Telegram → classified → journaled → indexed
-→ audited → reply); each subsequent day adds one domain or capability.
-Day 7 is the eval harness, deliberately last because it depends on the
-audit-log shape being stable. Day 8 is real-use shakedown; Day 9
-iteration; Day 10 the portfolio writeup.
+The execution queue is the GitHub issues at
+https://github.com/chijunzheng/personal-assistant/issues — 17 vertical-slice
+issues, each a tracer-bullet through the relevant layers, sequenced by
+explicit `Blocked by` references rather than calendar days. Issue #1
+(Telegram echo tracer) is the riskiest integration and unblocks everything;
+issues #2–#9 add the kernel skeleton + the five domain plugins; #10 wires
+the eight engineering Booleans symmetrically; #11 hardens Drive sync;
+#12–#13 add launchd cron + the eval harness; #14 fills per-domain eval
+cases; #15 is the real-use shakedown (HITL); #16 is iteration on shakedown
+findings; #17 is the portfolio writeup (HITL).
 
-A new fitness build slot will need to be inserted (likely as Day 4.5 or
-extending Day 4) since fitness was added as a fifth plugin during the
-final round of grilling.
+The dependency graph encoded in the issues replaces the day-by-day plan
+that initially lived in `IMPLEMENTATION.md` (deleted as redundant once
+the issues became the source of truth).
