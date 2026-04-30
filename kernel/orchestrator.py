@@ -36,6 +36,7 @@ from typing import Callable, Optional, Protocol
 from kernel.audit import write_audit_entry
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError, invoke as claude_invoke
 from kernel.classifier import Classifier, FALLBACK_INTENT
+from kernel.retrieval import gather_context
 from kernel.session import Session, load_or_create as session_load, update as session_update
 
 __all__ = [
@@ -156,6 +157,7 @@ class Orchestrator:
         classifier: Optional[Classifier] = None,
         clock: Optional[Callable[[], datetime]] = None,
         config_label: str = "default",
+        config: Optional[dict] = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         chat_id: str = DEFAULT_CHAT_ID,
     ) -> None:
@@ -167,6 +169,7 @@ class Orchestrator:
         self._classifier = classifier
         self._clock = clock or (lambda: datetime.now(tz=timezone.utc))
         self._config_label = config_label
+        self._config = config or {}
         self._system_prompt = system_prompt
         self._chat_id = chat_id
 
@@ -187,7 +190,17 @@ class Orchestrator:
         # preserve the issue-#1 echo path verbatim.
         intent = self._classify(message, started_ts)
 
-        # Step 2: dispatch. journal.* -> journal handler; else echo.
+        # Step 2: dispatch.
+        # journal.query -> journal read (retrieval + LLM)
+        # journal.*     -> journal write (capture path)
+        # everything else -> generic echo (issue #1 fallback)
+        if intent == "journal.query":
+            return self._handle_journal_query(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
         if intent.startswith("journal."):
             return self._handle_journal(
                 intent=intent,
@@ -312,6 +325,86 @@ class Orchestrator:
             text=f"Saved to journal/{Path(display_path).name}.",
             tokens_in=0,
             tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_journal_query(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch a ``journal.query`` intent through retrieval -> read -> reply.
+
+        Wires:
+          1. ``kernel.retrieval.gather_context`` -> ContextBundle
+          2. ``domains.journal.handler.read``    -> reply text + paths
+          3. Audit-log a ``read`` op carrying every consulted path
+        """
+        # Plugin imports stay lazy — kernel knows the plugin only by registry.
+        from domains.journal.handler import read as journal_read
+
+        bundle = gather_context(
+            query=message,
+            config=self._config,
+            vault_root=self._vault_root,
+            domain="journal",
+        )
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        reply_text = ""
+        tokens_in = 0
+        tokens_out = 0
+        paths: tuple = bundle.paths
+        try:
+            result = journal_read(
+                intent=intent,
+                query=message,
+                context_bundle=bundle,
+                invoker=self._invoker,
+            )
+            reply_text = result.reply_text
+            tokens_in = result.tokens_in
+            tokens_out = result.tokens_out
+            paths = result.consulted_paths
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "journal",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "paths": [str(p) for p in paths],
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong reading from the journal.",
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=reply_text,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             duration_ms=duration_ms,
         )
 
