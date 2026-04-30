@@ -177,6 +177,7 @@ class Orchestrator:
         inventory_query_parser: Optional[Callable[[str], dict]] = None,
         fitness_extractor: Optional[Callable[[str, str], dict]] = None,
         fitness_query_parser: Optional[Callable[[str], dict]] = None,
+        reminder_extractor: Optional[Callable[[str, str], dict]] = None,
     ) -> None:
         self._lock = lock or SingleInstanceLock(DEFAULT_LOCK_PATH)
         self._audit_root = Path(audit_root)
@@ -209,6 +210,10 @@ class Orchestrator:
         # four logging intents with very different output shapes.
         self._fitness_extractor = fitness_extractor
         self._fitness_query_parser = fitness_query_parser
+        # Pluggable reminder hook — the extractor is called with
+        # ``(message, intent)`` because the same plugin handles add /
+        # add_when / cancel with different output shapes.
+        self._reminder_extractor = reminder_extractor
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""
@@ -301,6 +306,20 @@ class Orchestrator:
             )
         if intent in ("fitness.workout_plan", "fitness.nutrition_plan"):
             return self._handle_fitness_plan(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent in ("reminder.add", "reminder.add_when", "reminder.cancel"):
+            return self._handle_reminder_write(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent == "reminder.list":
+            return self._handle_reminder_list(
                 intent=intent,
                 message=message,
                 started_ts=started_ts,
@@ -1111,6 +1130,165 @@ class Orchestrator:
         if outcome == "error":
             return OrchestratorReply(
                 text="Sorry — something went wrong generating that plan.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=reply_text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_reminder_write(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``reminder.{add,add_when,cancel}`` -> reminder write path.
+
+        Wires:
+          1. ``domains.reminder.handler.write`` -> appends events.jsonl
+          2. Audit-log a ``write`` op with ``domain=reminder`` and the path
+          3. Reply with a brief confirmation
+        """
+        # Lazy import keeps the kernel decoupled from plugin compile-time.
+        from domains.reminder.handler import write as reminder_write
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        path: Optional[Path] = None
+        appended = False
+        kind: Optional[str] = None
+        try:
+            result = reminder_write(
+                intent=intent,
+                message=message,
+                session=session,
+                vault_root=self._vault_root,
+                clock=self._clock,
+                extractor=self._reminder_extractor,
+                invoker=self._invoker,
+            )
+            path = result.path
+            appended = result.appended
+            kind = result.kind
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "write",
+            "actor": "kernel.orchestrator",
+            "domain": "reminder",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "appended": 1 if appended else 0,
+            "skipped": 0 if appended else 1,
+        }
+        if path is not None:
+            entry["path"] = str(path)
+        if kind is not None:
+            entry["kind"] = kind
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong saving that reminder.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        # Update the active session.
+        action = {
+            "reminder.add": "scheduled reminder",
+            "reminder.add_when": "state-derived reminder",
+            "reminder.cancel": "cancelled reminder",
+        }.get(intent, intent)
+        session_update(
+            session,
+            f"reminder: {action}",
+            vault_root=self._vault_root,
+            clock=self._clock,
+        )
+
+        if not appended:
+            text = "Already on file — reminder unchanged."
+        elif intent == "reminder.cancel":
+            text = "Reminder cancelled."
+        elif intent == "reminder.add_when":
+            text = "Reminder scheduled (will fire when the condition becomes true)."
+        else:
+            text = "Reminder scheduled."
+        return OrchestratorReply(
+            text=text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_reminder_list(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``reminder.list`` -> reminder read path."""
+        from domains.reminder.handler import read as reminder_read
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        reply_text = ""
+        try:
+            reply_text = reminder_read(
+                intent=intent,
+                query=message,
+                vault_root=self._vault_root,
+            )
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "reminder",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong reading your reminders.",
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,
