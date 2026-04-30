@@ -1,19 +1,25 @@
 """Per-turn dispatch + single-instance enforcement.
 
-The orchestrator owns three responsibilities for issue #1's tracer slice:
+The orchestrator owns:
 
   1. Hold a process-exclusive ``flock`` on the configured lock path so a
      second bot instance refuses to start (``kernel/RUNTIME.md`` ->
      "Single-instance enforcement"; ``kernel/SYNC.md`` defense #5 reasoning).
-  2. For each incoming message, invoke ``claude_runner.invoke`` with a
-     generic system prompt and return the LLM's reply.
-  3. Append one audit-log entry per turn capturing token telemetry,
+  2. For each incoming message:
+     a. Classify (kernel.classifier) -> intent label
+     b. Dispatch: if ``journal.*``, call the journal handler write path
+        and audit-log the write; otherwise fall through to the generic
+        ``claude_runner.invoke`` echo path (issue #1's tracer behavior is
+        the fallback for unrecognized intents).
+     c. Update the active session.
+  3. Append audit-log entries per operation capturing token telemetry,
      duration, and outcome.
 
-Classification, retrieval, and plugin dispatch live behind this seam in
-later issues — the contract here is intentionally narrow so the tracer
-slice stays small and the kernel's later expansion does not require
-reworking the per-turn flow.
+Retrieval and per-domain query dispatch (read paths for journal, finance,
+inventory, fitness, reminder) live behind this seam in later issues — the
+contract here grows by adding new ``intent.startswith(...)`` dispatch
+branches *only when a new write path needs the orchestrator to wire it*.
+Read/query paths route through ``kernel.retrieval`` (issue #10).
 """
 
 from __future__ import annotations
@@ -29,6 +35,8 @@ from typing import Callable, Optional, Protocol
 
 from kernel.audit import write_audit_entry
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError, invoke as claude_invoke
+from kernel.classifier import Classifier, FALLBACK_INTENT
+from kernel.session import Session, load_or_create as session_load, update as session_update
 
 __all__ = [
     "DEFAULT_LOCK_PATH",
@@ -41,6 +49,8 @@ __all__ = [
 
 DEFAULT_LOCK_PATH = Path("/tmp/personal-assistant.lock")
 DEFAULT_AUDIT_ROOT = Path("vault/_audit")
+DEFAULT_VAULT_ROOT = Path("vault")
+DEFAULT_CHAT_ID = "default"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise personal-assistant tracer. Reply briefly and helpfully."
 )
@@ -123,11 +133,16 @@ class OrchestratorReply:
 
 
 class Orchestrator:
-    """Wires per-turn flow: claude invoke -> audit-log -> reply.
+    """Wires per-turn flow: classify -> dispatch -> audit-log -> reply.
 
-    Dependencies are injected (``invoker``, ``audit_writer``, ``clock``)
-    so tests don't have to monkeypatch internals. Production callers can
-    rely on the defaults.
+    Dependencies are injected (``invoker``, ``classifier``, ``audit_writer``,
+    ``clock``) so tests don't have to monkeypatch internals. Production
+    callers can rely on the defaults.
+
+    The dispatch table is intentionally tiny right now: ``journal.*`` ->
+    journal handler write; everything else falls through to the generic
+    echo path (issue #1's behavior is preserved as the fallback for
+    unrecognized intents per issue #2's spec).
     """
 
     def __init__(
@@ -135,19 +150,25 @@ class Orchestrator:
         *,
         lock: Optional[SingleInstanceLock] = None,
         audit_root: str | os.PathLike[str] = DEFAULT_AUDIT_ROOT,
+        vault_root: str | os.PathLike[str] = DEFAULT_VAULT_ROOT,
         invoker: Optional[_ClaudeInvoker] = None,
         audit_writer: Optional[Callable[..., object]] = None,
+        classifier: Optional[Classifier] = None,
         clock: Optional[Callable[[], datetime]] = None,
         config_label: str = "default",
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        chat_id: str = DEFAULT_CHAT_ID,
     ) -> None:
         self._lock = lock or SingleInstanceLock(DEFAULT_LOCK_PATH)
         self._audit_root = Path(audit_root)
+        self._vault_root = Path(vault_root)
         self._invoker = invoker or claude_invoke
         self._audit_writer = audit_writer or write_audit_entry
+        self._classifier = classifier
         self._clock = clock or (lambda: datetime.now(tz=timezone.utc))
         self._config_label = config_label
         self._system_prompt = system_prompt
+        self._chat_id = chat_id
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""
@@ -158,9 +179,150 @@ class Orchestrator:
         self._lock.release()
 
     def handle_message(self, message: str) -> OrchestratorReply:
-        """Run one tracer turn: invoke claude_runner, log, return the reply."""
+        """Run one turn: classify, dispatch, audit, reply."""
         started_ts = self._clock()
         wall_start = time.monotonic()
+
+        # Step 1: classify (if a classifier is wired). With no classifier we
+        # preserve the issue-#1 echo path verbatim.
+        intent = self._classify(message, started_ts)
+
+        # Step 2: dispatch. journal.* -> journal handler; else echo.
+        if intent.startswith("journal."):
+            return self._handle_journal(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+
+        return self._handle_echo(
+            message=message,
+            started_ts=started_ts,
+            wall_start=wall_start,
+        )
+
+    # -- private ---------------------------------------------------------
+
+    def _classify(self, message: str, started_ts: datetime) -> str:
+        """Run the classifier and audit-log the result. Returns the intent."""
+        if self._classifier is None:
+            return ""  # echo path; no classification performed
+
+        wall_start = time.monotonic()
+        outcome = "ok"
+        error_message: Optional[str] = None
+        intent = FALLBACK_INTENT
+        try:
+            intent = self._classifier.classify(message)
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "classify",
+            "actor": "kernel.orchestrator",
+            "outcome": outcome,
+            "duration_ms": int((time.monotonic() - wall_start) * 1000),
+            "config": self._config_label,
+            "intent": intent,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+        return intent
+
+    def _handle_journal(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch a ``journal.*`` intent to the journal plugin's write path."""
+        # Imported lazily to keep the kernel free of compile-time plugin imports
+        # (the plugin contract is "kernel discovers, never knows by name").
+        from domains.journal.handler import write as journal_write
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        path: Optional[Path] = None
+        content_sha: Optional[str] = None
+        try:
+            result = journal_write(
+                intent=intent,
+                message=message,
+                session=session,
+                vault_root=self._vault_root,
+                clock=self._clock,
+            )
+            path = result.path
+            content_sha = result.content_sha256
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "write",
+            "actor": "kernel.orchestrator",
+            "domain": "journal",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+        }
+        if path is not None:
+            entry["path"] = str(path)
+        if content_sha is not None:
+            entry["sha256_after"] = content_sha
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error" or path is None:
+            return OrchestratorReply(
+                text="Sorry — something went wrong saving that to the journal.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        # Update the active session with a brief note about what just happened.
+        session_update(
+            session,
+            f"journal capture -> {path.name}",
+            vault_root=self._vault_root,
+            clock=self._clock,
+        )
+
+        # Reply with a path the user (or a future sub-agent) can verify.
+        try:
+            display_path = path.relative_to(self._vault_root)
+        except ValueError:
+            display_path = path
+        return OrchestratorReply(
+            text=f"Saved to journal/{Path(display_path).name}.",
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_echo(
+        self,
+        *,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Issue-#1 fallback: invoke the runner, log, return its text."""
         outcome = "ok"
         error_message: Optional[str] = None
         response: Optional[ClaudeResponse] = None
