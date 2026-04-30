@@ -66,6 +66,7 @@ from domains.fitness._paths import (
     PROFILE_RELATIVE,
     WORKOUTS_RELATIVE,
 )
+from domains.fitness._plans import PLAN_INTENTS, generate_plan
 from domains.fitness._query import query_fitness
 
 __all__ = [
@@ -729,28 +730,46 @@ def read(
     vault_root: str | os.PathLike[str],
     query_parser: Optional[Callable[[str], Mapping[str, Any]]] = None,
     invoker: Optional[_ClaudeInvoker] = None,
+    clock: Optional[Callable[[], datetime]] = None,
 ) -> str:
-    """Answer a ``fitness.query`` with a real numeric aggregation.
+    """Answer a fitness read-side intent.
+
+    Routes by intent:
+
+      - ``fitness.query``         -> structured aggregation via ``query_fitness``
+      - ``fitness.workout_plan``  -> 7-step plan generation (``_plans.generate_plan``)
+      - ``fitness.nutrition_plan`` -> same recipe, nutrition-specific inputs
 
     Args:
-        intent: must be ``fitness.query``.
-        query: the user's free-form question.
+        intent: the read-side intent to handle.
+        query: the user's free-form question / request.
         vault_root: vault root on disk.
-        query_parser: pluggable mapper from the question to a dict with
-            ``kind`` + ``date_range`` + ``agg`` (and optional ``metric_kind``).
-            Tests inject one so the unit test doesn't shell to the LLM.
-        invoker: pluggable ``claude_runner.invoke`` used when no parser is
-            supplied.
+        query_parser: pluggable mapper for ``fitness.query``; tests inject
+            one so the unit test doesn't shell to the LLM.
+        invoker: pluggable ``claude_runner.invoke`` used for plan
+            generation (and as fallback for ``fitness.query`` parsing).
+        clock: pluggable clock; defaults to ``datetime.now(tz=UTC)``.
 
     Returns:
         A reply string the orchestrator hands back to Telegram.
 
     Raises:
-        ValueError: ``intent`` is not ``fitness.query``.
+        ValueError: ``intent`` is not a registered fitness read intent.
     """
+    if intent in PLAN_INTENTS:
+        result = generate_plan(
+            intent=intent,
+            query=query,
+            vault_root=Path(vault_root),
+            invoker=invoker or claude_invoke,
+            clock=clock,
+        )
+        return result["reply"]
+
     if intent != _INTENT_QUERY:
         raise ValueError(
-            f"fitness.read only handles {_INTENT_QUERY}, not {intent!r}"
+            f"fitness.read only handles {_INTENT_QUERY} or {PLAN_INTENTS}, "
+            f"not {intent!r}"
         )
 
     if query_parser is not None:

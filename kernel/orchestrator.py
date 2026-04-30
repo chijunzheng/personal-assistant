@@ -299,6 +299,13 @@ class Orchestrator:
                 started_ts=started_ts,
                 wall_start=wall_start,
             )
+        if intent in ("fitness.workout_plan", "fitness.nutrition_plan"):
+            return self._handle_fitness_plan(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
 
         return self._handle_echo(
             message=message,
@@ -1037,6 +1044,73 @@ class Orchestrator:
         if outcome == "error":
             return OrchestratorReply(
                 text="Sorry — something went wrong reading from your fitness log.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=reply_text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_fitness_plan(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``fitness.workout_plan`` / ``fitness.nutrition_plan`` -> fitness.read.
+
+        Plan generation runs the 7-step recipe in ``domains/fitness/prompt.md``
+        and writes a markdown plan to ``vault/fitness/plans/``. The audit
+        entry records ``op=read`` (the user's perspective is "the agent
+        gave me a plan") with ``domain=fitness`` so downstream eval tools
+        can attribute the work.
+        """
+        from domains.fitness.handler import read as fitness_read
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        reply_text = ""
+        try:
+            reply_text = fitness_read(
+                intent=intent,
+                query=message,
+                vault_root=self._vault_root,
+                invoker=self._invoker,
+                clock=self._clock,
+            )
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "fitness",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong generating that plan.",
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,

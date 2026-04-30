@@ -767,12 +767,18 @@ def test_query_fitness_profile_returns_state(tmp_path: Path) -> None:
     assert result["weight_kg"] == 78.0
 
 
-def test_query_fitness_compliance_stub_returns_na(tmp_path: Path) -> None:
-    """kind=compliance is stubbed in #7 (#8 fills it in)."""
+def test_query_fitness_compliance_returns_zero_for_no_plan_id(tmp_path: Path) -> None:
+    """kind=compliance with no plan_id (or unknown plan_id) -> value 0.0.
+
+    Implemented in #8: the score is a 0..1 float; missing inputs yield 0.0
+    rather than the n/a stub the #7 placeholder used.
+    """
     vault_root = tmp_path / "vault"
 
     result = query_fitness(kind="compliance", vault_root=vault_root)
-    assert result.get("status") == "n/a" or result.get("value") == "n/a"
+    assert result["kind"] == "compliance"
+    assert isinstance(result["value"], (int, float))
+    assert float(result["value"]) == 0.0
 
 
 def test_query_fitness_rejects_unknown_kind(tmp_path: Path) -> None:

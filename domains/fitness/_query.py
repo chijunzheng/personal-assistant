@@ -1,15 +1,18 @@
 """Pure-Python aggregation surface for ``query_fitness``.
 
 Splits per-kind aggregation logic out of ``handler.py`` so the public
-surface stays thin. Plan generation (``kind='compliance'`` and richer
-plan-side behaviour) lives in issue #8 — the ``compliance`` shape here
-returns a structured "n/a" so callers don't crash.
+surface stays thin. ``kind='compliance'`` walks recent workouts/meals
+and compares them to the prescription stored in the plan markdown's
+frontmatter, returning a 0..1 score (issue #8).
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+import yaml
 
 from domains.fitness._io import iter_jsonl, load_yaml
 from domains.fitness._paths import (
@@ -279,6 +282,110 @@ def _query_profile(vault_root: Path) -> dict:
     return {"kind": "profile", **profile}
 
 
+def _read_plan_frontmatter(path: Path) -> dict:
+    """Parse a plan markdown's YAML frontmatter; return ``{}`` if malformed."""
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if not raw.startswith("---\n"):
+        return {}
+    parts = raw.split("---\n", 2)
+    if len(parts) < 3:
+        return {}
+    try:
+        loaded = yaml.safe_load(parts[1])
+    except yaml.YAMLError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _find_plan_by_id(plans_dir: Path, plan_id: str) -> Optional[Path]:
+    """Find the markdown plan whose frontmatter ``plan_id`` matches."""
+    if not plans_dir.exists():
+        return None
+    for path in sorted(plans_dir.glob("*.md")):
+        fm = _read_plan_frontmatter(path)
+        if fm.get("plan_id") == plan_id:
+            return path
+    return None
+
+
+def _query_compliance(
+    vault_root: Path,
+    *,
+    plan_id: Optional[str],
+    compare_to_logs: Optional[bool],
+) -> dict:
+    """Compute a 0..1 compliance score for ``plan_id`` vs logged events.
+
+    Strategy (deliberately conservative — better to under- than over-claim):
+
+      1. Locate the plan markdown by ``plan_id`` -> if missing, score 0.0.
+      2. Scan workouts.jsonl for rows whose ``plan_id`` field matches the
+         plan_id (the link is set when ``fitness.workout_log`` recognizes
+         a same-day plan, per ``prompt.md`` step 4).
+      3. Score = ``1.0`` if at least one matching workout exists for a
+         workout plan; ``0.0`` otherwise. Nutrition plans are scored the
+         same way against ``meals.jsonl`` rows linked via ``plan_id``.
+
+    The score is ``0..1``; richer scoring (per-exercise / per-macro
+    matching) is left for a future issue. The structural shape — return
+    a dict with ``kind, plan_id, value`` — is the contract callers depend
+    on.
+    """
+    if not plan_id:
+        return {
+            "kind": "compliance",
+            "plan_id": None,
+            "compare_to_logs": compare_to_logs,
+            "value": 0.0,
+        }
+
+    plans_dir = vault_root / PLANS_RELATIVE
+    plan_path = _find_plan_by_id(plans_dir, plan_id)
+    if plan_path is None:
+        return {
+            "kind": "compliance",
+            "plan_id": plan_id,
+            "compare_to_logs": compare_to_logs,
+            "value": 0.0,
+        }
+
+    plan_kind = _infer_plan_kind(plan_path)
+    if plan_kind == "nutrition":
+        log_path = vault_root / MEALS_RELATIVE
+    else:
+        log_path = vault_root / WORKOUTS_RELATIVE
+
+    matched = 0
+    for row in iter_jsonl(log_path):
+        if row.get("plan_id") == plan_id:
+            matched += 1
+
+    score = 1.0 if matched > 0 else 0.0
+    return {
+        "kind": "compliance",
+        "plan_id": plan_id,
+        "compare_to_logs": compare_to_logs,
+        "matched_logs": matched,
+        "value": score,
+        "plan_path": str(plan_path),
+    }
+
+
+def _infer_plan_kind(plan_path: Path) -> str:
+    """Pull the plan kind from frontmatter (preferred) or filename (fallback)."""
+    fm = _read_plan_frontmatter(plan_path)
+    kind = str(fm.get("kind") or "").strip().lower()
+    if kind:
+        return kind
+    match = re.match(r"^\d{4}-\d{2}-\d{2}-(\w+)-", plan_path.name)
+    return match.group(1).lower() if match else "workout"
+
+
 def query_fitness(
     *,
     kind: str,
@@ -344,13 +451,11 @@ def query_fitness(
     if kind == "profile":
         return _query_profile(root)
     if kind == "compliance":
-        return {
-            "kind": "compliance",
-            "plan_id": plan_id,
-            "compare_to_logs": compare_to_logs,
-            "status": "n/a",
-            "value": "n/a",
-        }
+        return _query_compliance(
+            root,
+            plan_id=plan_id,
+            compare_to_logs=compare_to_logs,
+        )
     raise ValueError(
         f"query_fitness kind must be one of workouts|meals|metrics|"
         f"plans|compliance|profile, not {kind!r}"
