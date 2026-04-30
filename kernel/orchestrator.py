@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from typing import Callable, Optional, Protocol
 from kernel.audit import write_audit_entry
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError, invoke as claude_invoke
 from kernel.classifier import Classifier, FALLBACK_INTENT
+from kernel.index import refresh as index_refresh_default
 from kernel.retrieval import gather_context
 from kernel.session import Session, load_or_create as session_load, update as session_update
 
@@ -55,6 +57,14 @@ DEFAULT_CHAT_ID = "default"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise personal-assistant tracer. Reply briefly and helpfully."
 )
+
+# Where the writes-since-last-refresh counter is persisted. Lives under
+# ``vault/_index/`` next to INDEX.md so it shares the same Drive sync scope.
+_REFRESH_STATE_RELATIVE = Path("_index") / ".refresh_state.json"
+
+# Default threshold pulled from configs/default.yaml; the orchestrator
+# accepts an override via ``config.context_engineering.index_refresh_after_writes``.
+_DEFAULT_INDEX_REFRESH_AFTER_WRITES = 5
 
 
 class InstanceLockError(RuntimeError):
@@ -160,6 +170,7 @@ class Orchestrator:
         config: Optional[dict] = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         chat_id: str = DEFAULT_CHAT_ID,
+        index_refresh: Optional[Callable[..., object]] = None,
     ) -> None:
         self._lock = lock or SingleInstanceLock(DEFAULT_LOCK_PATH)
         self._audit_root = Path(audit_root)
@@ -172,6 +183,10 @@ class Orchestrator:
         self._config = config or {}
         self._system_prompt = system_prompt
         self._chat_id = chat_id
+        # Pluggable index refresh entry point (default: kernel.index.refresh).
+        # Tests inject a spy that wraps the real refresh; production uses the
+        # default so callers don't have to wire it explicitly.
+        self._index_refresh = index_refresh or index_refresh_default
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""
@@ -316,6 +331,12 @@ class Orchestrator:
             clock=self._clock,
         )
 
+        # The journal write succeeded -> bump the writes-since-last-refresh
+        # counter. When the counter reaches the configured threshold, the
+        # helper calls ``index.refresh()`` inline, audit-logs the refresh,
+        # and resets the counter. (Issue #4 acceptance criterion.)
+        self._maybe_refresh_index(started_ts=started_ts)
+
         # Reply with a path the user (or a future sub-agent) can verify.
         try:
             display_path = path.relative_to(self._vault_root)
@@ -458,3 +479,121 @@ class Orchestrator:
             tokens_out=response.tokens_out,
             duration_ms=duration_ms,
         )
+
+    # -- index refresh ---------------------------------------------------
+
+    def _refresh_state_path(self) -> Path:
+        """Where the writes-since-last-refresh counter is persisted."""
+        return self._vault_root / _REFRESH_STATE_RELATIVE
+
+    def _read_refresh_state(self) -> dict:
+        """Load the persistent state, returning a fresh dict if absent/corrupt.
+
+        The state file is intentionally tiny and the read is cheap; we keep
+        it on disk rather than in process memory so a kernel restart picks
+        up the existing counter (issue #4: "writes since last refresh" is
+        a vault-level invariant, not a process-level one).
+        """
+        state_path = self._refresh_state_path()
+        if not state_path.exists():
+            return {"writes_since_last_refresh": 0}
+        try:
+            raw = state_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {"writes_since_last_refresh": 0}
+            return data
+        except (OSError, json.JSONDecodeError):
+            return {"writes_since_last_refresh": 0}
+
+    def _write_refresh_state(self, state: dict) -> None:
+        """Persist the writes counter via ``vault.atomic_write`` so Drive sync stays happy."""
+        # Lazy import keeps the module-level import graph small for tests
+        # that monkeypatch around the kernel.
+        from kernel.vault import atomic_write
+
+        state_path = self._refresh_state_path()
+        atomic_write(state_path, json.dumps(state, sort_keys=True) + "\n")
+
+    def _refresh_threshold(self) -> int:
+        """Pull the configured threshold; fall back to the default.
+
+        Honors ``config.context_engineering.index_refresh_after_writes``
+        first (matches ``configs/default.yaml``'s shape) then falls back
+        to ``config.index_refresh_after_writes`` (a flat-shaped config
+        helpful in tests) and finally to ``5``.
+        """
+        ce = (self._config or {}).get("context_engineering") or {}
+        threshold = ce.get("index_refresh_after_writes")
+        if threshold is None:
+            threshold = (self._config or {}).get("index_refresh_after_writes")
+        if threshold is None:
+            return _DEFAULT_INDEX_REFRESH_AFTER_WRITES
+        return max(1, int(threshold))
+
+    def _maybe_refresh_index(self, *, started_ts: datetime) -> None:
+        """Increment the write counter; refresh + audit-log + reset at threshold.
+
+        Called after any successful vault write. The refresh runs inline
+        and is audit-logged with ``op=index_refresh`` (carrying duration_ms
+        and a few count-fields from ``RefreshResult``).
+
+        A refresh failure is captured as ``outcome=error`` on the audit
+        line; the counter is NOT reset on failure so the next write
+        retries the refresh.
+        """
+        state = self._read_refresh_state()
+        count = int(state.get("writes_since_last_refresh", 0)) + 1
+        threshold = self._refresh_threshold()
+
+        if count < threshold:
+            self._write_refresh_state({"writes_since_last_refresh": count})
+            return
+
+        # Threshold hit — refresh inline and reset.
+        wall_start = time.monotonic()
+        outcome = "ok"
+        error_message: Optional[str] = None
+        files_indexed = 0
+        clusters = 0
+        tags = 0
+        orphans = 0
+        try:
+            result = self._index_refresh(
+                self._vault_root,
+                config=self._config,
+                clock=self._clock,
+            )
+            files_indexed = getattr(result, "files_indexed", 0)
+            clusters = getattr(result, "clusters", 0)
+            tags = getattr(result, "tags", 0)
+            orphans = getattr(result, "orphans", 0)
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "index_refresh",
+            "actor": "kernel.orchestrator",
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "writes_since_last_refresh": count,
+            "files_indexed": files_indexed,
+            "clusters": clusters,
+            "tags": tags,
+            "orphans": orphans,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        # Reset the counter only on a clean refresh; on error, leave the
+        # counter at the threshold so the next write retries.
+        if outcome == "ok":
+            self._write_refresh_state({"writes_since_last_refresh": 0})
+        else:
+            self._write_refresh_state({"writes_since_last_refresh": count})
