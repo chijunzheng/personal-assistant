@@ -171,6 +171,8 @@ class Orchestrator:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         chat_id: str = DEFAULT_CHAT_ID,
         index_refresh: Optional[Callable[..., object]] = None,
+        finance_extractor: Optional[Callable[[str], list]] = None,
+        finance_query_parser: Optional[Callable[[str], dict]] = None,
     ) -> None:
         self._lock = lock or SingleInstanceLock(DEFAULT_LOCK_PATH)
         self._audit_root = Path(audit_root)
@@ -187,6 +189,12 @@ class Orchestrator:
         # Tests inject a spy that wraps the real refresh; production uses the
         # default so callers don't have to wire it explicitly.
         self._index_refresh = index_refresh or index_refresh_default
+        # Pluggable finance hooks — tests inject deterministic stand-ins so
+        # neither the LLM-backed extractor nor the LLM-backed query parser
+        # actually runs during integration tests. Production callers leave
+        # these as ``None`` and the handler shells to ``claude_runner``.
+        self._finance_extractor = finance_extractor
+        self._finance_query_parser = finance_query_parser
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""
@@ -206,9 +214,11 @@ class Orchestrator:
         intent = self._classify(message, started_ts)
 
         # Step 2: dispatch.
-        # journal.query -> journal read (retrieval + LLM)
-        # journal.*     -> journal write (capture path)
-        # everything else -> generic echo (issue #1 fallback)
+        # journal.query     -> journal read (retrieval + LLM)
+        # journal.*         -> journal write (capture path)
+        # finance.query     -> finance read (structured query_finance)
+        # finance.transaction -> finance write (extract + append)
+        # everything else   -> generic echo (issue #1 fallback)
         if intent == "journal.query":
             return self._handle_journal_query(
                 intent=intent,
@@ -218,6 +228,20 @@ class Orchestrator:
             )
         if intent.startswith("journal."):
             return self._handle_journal(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent == "finance.query":
+            return self._handle_finance_query(
+                intent=intent,
+                message=message,
+                started_ts=started_ts,
+                wall_start=wall_start,
+            )
+        if intent == "finance.transaction":
+            return self._handle_finance_transaction(
                 intent=intent,
                 message=message,
                 started_ts=started_ts,
@@ -426,6 +450,187 @@ class Orchestrator:
             text=reply_text,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_finance_transaction(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``finance.transaction`` to the finance plugin's write path.
+
+        Wires:
+          1. ``domains.finance.handler.write`` -> appends transactions.jsonl
+          2. Audit-log a ``write`` op with ``domain=finance`` and the path
+          3. Trigger the every-5-writes index refresh
+          4. Reply with a count + skipped summary so the user can verify
+        """
+        # Lazy import keeps the kernel decoupled from plugin compile-time.
+        from domains.finance.handler import write as finance_write
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        path: Optional[Path] = None
+        appended = 0
+        skipped = 0
+        try:
+            result = finance_write(
+                intent=intent,
+                message=message,
+                session=session,
+                vault_root=self._vault_root,
+                clock=self._clock,
+                extractor=self._finance_extractor,
+                invoker=self._invoker,
+            )
+            path = result.path
+            appended = result.appended
+            skipped = result.skipped
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "write",
+            "actor": "kernel.orchestrator",
+            "domain": "finance",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "appended": appended,
+            "skipped": skipped,
+        }
+        if path is not None:
+            entry["path"] = str(path)
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong saving those transactions.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        # Update the active session with a one-line note about the upload.
+        session_update(
+            session,
+            f"finance: appended {appended} transaction(s), skipped {skipped} duplicate(s)",
+            vault_root=self._vault_root,
+            clock=self._clock,
+        )
+
+        # Bump the writes-since-refresh counter just like journal does — only
+        # when at least one row genuinely landed on disk.
+        if appended > 0:
+            self._maybe_refresh_index(started_ts=started_ts)
+
+        if appended == 0 and skipped > 0:
+            text = (
+                f"Statement already on file — {skipped} transaction(s) were "
+                f"already recorded; 0 new rows appended."
+            )
+        else:
+            text = (
+                f"Recorded {appended} transaction(s)"
+                + (f"; {skipped} already on file" if skipped else "")
+                + "."
+            )
+        return OrchestratorReply(
+            text=text,
+            tokens_in=0,
+            tokens_out=0,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_finance_query(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> OrchestratorReply:
+        """Dispatch ``finance.query`` to the finance plugin's read path.
+
+        The finance read does its own structured aggregation (no retrieval
+        bundle is needed for a numeric answer). The audit entry records
+        the path of the canonical transactions log so the user can
+        reconstruct the answer offline.
+        """
+        from domains.finance.handler import read as finance_read
+
+        session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        reply_text = ""
+        category: Optional[str] = None
+        agg: Optional[str] = None
+        count = 0
+        try:
+            result = finance_read(
+                intent=intent,
+                query=message,
+                vault_root=self._vault_root,
+                query_parser=self._finance_query_parser,
+                invoker=self._invoker,
+            )
+            reply_text = result.reply_text
+            category = result.category
+            agg = result.agg
+            count = result.count
+        except Exception as err:  # noqa: BLE001
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "finance",
+            "intent": intent,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "match_count": count,
+        }
+        if category is not None:
+            entry["category"] = category
+        if agg is not None:
+            entry["agg"] = agg
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if outcome == "error":
+            return OrchestratorReply(
+                text="Sorry — something went wrong querying your transactions.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=reply_text,
+            tokens_in=0,
+            tokens_out=0,
             duration_ms=duration_ms,
         )
 
