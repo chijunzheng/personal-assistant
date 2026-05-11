@@ -416,6 +416,7 @@ def generate_plan(
     vault_root: Path,
     invoker: _ClaudeInvoker,
     clock: Optional[callable] = None,
+    chat_context_preamble: str = "",
 ) -> dict:
     """Run the 7-step recipe, save the plan, return a dispatch summary.
 
@@ -427,6 +428,13 @@ def generate_plan(
         "path": Optional[Path],  # where the plan landed (if any)
         "plan_id": Optional[str],
       }
+
+    ``chat_context_preamble`` (issue #27) is the rendered "Recent
+    conversation" block forwarded by the orchestrator. When present, the
+    underlying workout / nutrition prompt builders prepend it before the
+    grounding sections so the LLM sees the user's prior turns alongside
+    the structured inputs (e.g., a nutrition-plan request followed by
+    *"now do a workout one too"* keeps the goal in scope).
     """
     if intent not in PLAN_INTENTS:
         raise ValueError(
@@ -467,6 +475,7 @@ def generate_plan(
             plan_kind=plan_kind,
             profile=profile,
             profile_sha=profile_sha,
+            chat_context_preamble=chat_context_preamble,
         )
     return _generate_nutrition(
         vault_root=vault_root,
@@ -475,6 +484,7 @@ def generate_plan(
         plan_kind=plan_kind,
         profile=profile,
         profile_sha=profile_sha,
+        chat_context_preamble=chat_context_preamble,
     )
 
 
@@ -491,6 +501,7 @@ def _generate_workout(
     plan_kind: str,
     profile: Mapping[str, Any],
     profile_sha: str,
+    chat_context_preamble: str = "",
 ) -> dict:
     workouts = _recent_workouts(vault_root, now)
     metrics = _recent_metrics(vault_root, now)
@@ -511,6 +522,7 @@ def _generate_workout(
         recovery_metric_lookback_days=_RECOVERY_METRIC_LOOKBACK_DAYS,
         journal_lookback_days=_JOURNAL_LOOKBACK_DAYS,
         last_plan_lookback_days=_LAST_PLAN_LOOKBACK_DAYS,
+        chat_context_preamble=chat_context_preamble,
     )
 
     response = invoker(prompt, system_prompt=None)
@@ -564,6 +576,7 @@ def _generate_nutrition(
     plan_kind: str,
     profile: Mapping[str, Any],
     profile_sha: str,
+    chat_context_preamble: str = "",
 ) -> dict:
     meals = _recent_meals(vault_root, now)
     metric_rows = _recent_metrics(vault_root, now)
@@ -592,6 +605,7 @@ def _generate_nutrition(
         weight_lookback_days=_NUTRITION_WEIGHT_LOOKBACK_DAYS,
         journal_lookback_days=_JOURNAL_LOOKBACK_DAYS,
         last_plan_lookback_days=_LAST_PLAN_LOOKBACK_DAYS,
+        chat_context_preamble=chat_context_preamble,
     )
 
     response = invoker(prompt, system_prompt=None)

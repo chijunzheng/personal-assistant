@@ -208,10 +208,18 @@ def build_workout_prompt(
     recovery_metric_lookback_days: int,
     journal_lookback_days: int,
     last_plan_lookback_days: int,
+    chat_context_preamble: str = "",
 ) -> str:
-    """Assemble the workout-plan prompt fed to ``claude_runner.invoke``."""
+    """Assemble the workout-plan prompt fed to ``claude_runner.invoke``.
+
+    When ``chat_context_preamble`` is non-empty (issue #27) it is
+    prepended verbatim before the structured grounding sections so the
+    LLM sees what the user has been talking about (e.g., a prior
+    nutrition-plan request). Empty string keeps the issue-#8 prompt
+    shape unchanged for backward compatibility with existing eval cases.
+    """
     profile_yaml = yaml.safe_dump(dict(profile), sort_keys=True).strip()
-    return (
+    body = (
         f"Generate a workout plan for {date_for}.\n\n"
         f"## Profile (vault/fitness/profile.yaml)\n{profile_yaml}\n\n"
         f"## Recent workouts (last {workout_lookback_days} days)\n"
@@ -229,6 +237,9 @@ def build_workout_prompt(
         "instead of a max effort.\n"
         + _OUTPUT_CONTRACT
     )
+    if chat_context_preamble:
+        return f"{chat_context_preamble}{body}"
+    return body
 
 
 def build_nutrition_prompt(
@@ -245,13 +256,20 @@ def build_nutrition_prompt(
     weight_lookback_days: int,
     journal_lookback_days: int,
     last_plan_lookback_days: int,
+    chat_context_preamble: str = "",
 ) -> str:
-    """Assemble the nutrition-plan prompt fed to ``claude_runner.invoke``."""
+    """Assemble the nutrition-plan prompt fed to ``claude_runner.invoke``.
+
+    When ``chat_context_preamble`` is non-empty (issue #27) it is
+    prepended verbatim before the structured grounding sections so a
+    follow-up like *"now do a workout one too"* arrives at the LLM
+    with the prior nutrition request still visible.
+    """
     profile_yaml = yaml.safe_dump(dict(profile), sort_keys=True).strip()
     restrictions = ", ".join(profile.get("dietary_restrictions") or []) or "(none)"
     target_kcal = profile.get("target_calories_kcal")
     target_protein = profile.get("target_protein_g")
-    return (
+    body = (
         f"Generate a nutrition plan for {date_for}.\n\n"
         f"## Profile (target_calories_kcal={target_kcal}, "
         f"target_protein_g={target_protein}, restrictions={restrictions})\n"
@@ -272,6 +290,9 @@ def build_nutrition_prompt(
         f"foods that violate the dietary restrictions ({restrictions}).\n"
         + _OUTPUT_CONTRACT
     )
+    if chat_context_preamble:
+        return f"{chat_context_preamble}{body}"
+    return body
 
 
 # ---------------------------------------------------------------------------

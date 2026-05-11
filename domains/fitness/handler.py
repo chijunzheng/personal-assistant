@@ -731,6 +731,7 @@ def read(
     query_parser: Optional[Callable[[str], Mapping[str, Any]]] = None,
     invoker: Optional[_ClaudeInvoker] = None,
     clock: Optional[Callable[[], datetime]] = None,
+    chat_context_preamble: str = "",
 ) -> str:
     """Answer a fitness read-side intent.
 
@@ -749,6 +750,12 @@ def read(
         invoker: pluggable ``claude_runner.invoke`` used for plan
             generation (and as fallback for ``fitness.query`` parsing).
         clock: pluggable clock; defaults to ``datetime.now(tz=UTC)``.
+        chat_context_preamble: optional rendered "Recent conversation"
+            block (issue #27). Forwarded to ``generate_plan`` for the
+            plan-generation intents so the LLM sees the prior turns
+            (e.g., a nutrition-plan request followed by *"now do a
+            workout one too"*). The structured ``fitness.query`` path
+            does not consume it — its reply is purely numeric.
 
     Returns:
         A reply string the orchestrator hands back to Telegram.
@@ -763,6 +770,7 @@ def read(
             vault_root=Path(vault_root),
             invoker=invoker or claude_invoke,
             clock=clock,
+            chat_context_preamble=chat_context_preamble,
         )
         return result["reply"]
 

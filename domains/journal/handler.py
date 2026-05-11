@@ -227,8 +227,21 @@ def _format_snippet(source: str, text: str) -> str:
     return f"## Source: {source}\n\n{body}\n"
 
 
-def _compose_read_prompt(*, query: str, context_bundle: ContextBundle) -> str:
-    """Build the per-turn read prompt: context blocks + question + cite directive."""
+def _compose_read_prompt(
+    *,
+    query: str,
+    context_bundle: ContextBundle,
+    chat_context_preamble: str = "",
+) -> str:
+    """Build the per-turn read prompt: context blocks + question + cite directive.
+
+    When ``chat_context_preamble`` is non-empty it is prepended verbatim
+    so the LLM sees the user's recent turns BEFORE the retrieval block.
+    The preamble is rendered by ``kernel.chat_context.compose_recent_preamble``
+    upstream — this handler just sandwiches it ahead of the retrieval
+    blocks. Empty preamble is a no-op so legacy callers (and the empty-
+    history case) keep the original prompt shape verbatim.
+    """
     if not context_bundle.snippets:
         context_block = "(no notes were retrieved for this query)"
     else:
@@ -242,7 +255,7 @@ def _compose_read_prompt(*, query: str, context_bundle: ContextBundle) -> str:
         else "(none)"
     )
 
-    return (
+    body = (
         "# Retrieved notes\n\n"
         f"{context_block}\n\n"
         "# Consulted files\n\n"
@@ -255,6 +268,10 @@ def _compose_read_prompt(*, query: str, context_bundle: ContextBundle) -> str:
         "say so explicitly rather than speculating.\n"
     )
 
+    if chat_context_preamble:
+        return f"{chat_context_preamble}{body}"
+    return body
+
 
 def read(
     *,
@@ -262,6 +279,7 @@ def read(
     query: str,
     context_bundle: ContextBundle,
     invoker: Optional[_ClaudeInvoker] = None,
+    chat_context_preamble: str = "",
 ) -> JournalReadResult:
     """Answer a journal query using the retrieved context bundle.
 
@@ -271,6 +289,11 @@ def read(
         context_bundle: what ``kernel.retrieval.gather_context`` produced.
         invoker: pluggable ``claude_runner.invoke`` for tests; defaults to
             the production runner so production callers don't have to wire it.
+        chat_context_preamble: optional verbatim "Recent conversation"
+            block (rendered by ``kernel.chat_context.compose_recent_preamble``)
+            prepended to the LLM prompt so referential follow-ups
+            resolve against the prior turns. Empty string keeps the
+            issue-#3 prompt shape verbatim.
 
     Returns:
         A ``JournalReadResult`` carrying the reply text, the consulted paths
@@ -278,7 +301,11 @@ def read(
     """
     runner = invoker or claude_invoke
 
-    prompt = _compose_read_prompt(query=query, context_bundle=context_bundle)
+    prompt = _compose_read_prompt(
+        query=query,
+        context_bundle=context_bundle,
+        chat_context_preamble=chat_context_preamble,
+    )
     system_prompt = _load_system_prompt()
 
     response = runner(prompt, system_prompt=system_prompt or None)

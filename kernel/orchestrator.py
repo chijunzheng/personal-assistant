@@ -38,6 +38,7 @@ from typing import Callable, Optional, Protocol
 from kernel import chat_log
 from kernel.audit import write_audit_entry
 from kernel.capabilities import build_capabilities_preamble
+from kernel.chat_context import ChatContext, compose_recent_preamble
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError, invoke as claude_invoke
 from kernel.classifier import Classifier, FALLBACK_INTENT
 from kernel.index import refresh as index_refresh_default
@@ -102,17 +103,15 @@ def _compose_echo_prompt(*, message: str, recent: list) -> str:
     ``ChatTurn`` (chronological, newest last); when empty, the function
     returns the message unchanged so the issue-#1 prompt shape is
     preserved verbatim for fresh sessions.
-    """
-    if not recent:
-        return message
 
-    lines = ["## Recent conversation"]
-    for turn in recent:
-        lines.append(f"User: {turn.user_msg}")
-        lines.append(f"You: {turn.bot_reply}")
-    lines.append("")
-    lines.append(message)
-    return "\n".join(lines)
+    Delegates to ``kernel.chat_context.compose_recent_preamble`` so the
+    rendering stays consistent with every other handler that folds
+    chat-context into its prompt (journal-query, fitness-plan).
+    """
+    preamble = compose_recent_preamble(recent)
+    if not preamble:
+        return message
+    return f"{preamble}{message}"
 
 
 class InstanceLockError(RuntimeError):
@@ -274,6 +273,13 @@ class Orchestrator:
         # ``(message, intent)`` because the same plugin handles add /
         # add_when / cancel with different output shapes.
         self._reminder_extractor = reminder_extractor
+        # Per-turn ChatContext — populated at the top of every
+        # ``handle_message`` call, consumed by dispatch helpers.
+        # Seeded with the empty default so any helper that runs outside
+        # a ``handle_message`` boundary (e.g., a future reminder
+        # dispatcher reusing the orchestrator) sees a usable value
+        # rather than ``AttributeError``.
+        self._chat_context: ChatContext = ChatContext()
 
     def _substitute_capabilities(self, system_prompt: str) -> str:
         """Replace ``{capabilities}`` in the supplied system prompt.
@@ -298,25 +304,93 @@ class Orchestrator:
         self._lock.release()
 
     def handle_message(self, message: str) -> OrchestratorReply:
-        """Run one turn: classify, dispatch, audit, reply."""
+        """Run one turn: classify, dispatch, audit, reply.
+
+        Per the ADR (chat-context section), the orchestrator loads a
+        ``ChatContext`` (verbatim recent turns + the active-session
+        summary) ONCE at the top of the turn and stashes it on
+        ``self._chat_context`` so the dispatch helpers pick it up
+        without threading the value through every signature. After
+        dispatch (success OR error), a single ``chat_log.append`` at
+        the bottom records the turn — that consolidation means every
+        handler benefits from chat-context continuity, not just the
+        echo fallback (issue #27).
+        """
         started_ts = self._clock()
         wall_start = time.monotonic()
 
+        # Step 0: assemble the per-turn ChatContext exactly once. Both
+        # sub-loads degrade gracefully — a missing chat log or a fresh
+        # session yields an empty context rather than dropping the
+        # user's message. The classifier wiring (#28) will pick this up
+        # via ``self._chat_context``; the seam is left ready here.
+        self._chat_context = self._load_chat_context()
+
         # Step 1: classify (if a classifier is wired). With no classifier we
         # preserve the issue-#1 echo path verbatim.
+        # TODO(#28): pass ``self._chat_context`` into ``self._classify`` once
+        # the classifier prompt template grows a ``{recent_turns}`` slot.
         intent = self._classify(message, started_ts)
 
-        # Step 2: dispatch.
-        # journal.query        -> journal read (retrieval + LLM)
-        # journal.*            -> journal write (capture path)
-        # finance.query        -> finance read (structured query_finance)
-        # finance.transaction  -> finance write (extract + append)
-        # inventory.{add,consume,adjust} -> inventory write (event log + state)
-        # inventory.{query,list_low}     -> inventory read (query_inventory)
-        # fitness.{workout_log,meal_log,metric_log,profile_update}
-        #                      -> fitness write (logging surface, issue #7)
-        # fitness.query        -> fitness read (query_fitness)
-        # everything else      -> generic echo (issue #1 fallback)
+        # Step 2: dispatch on the classified intent. Per-intent helpers
+        # pick up the per-turn ``self._chat_context`` directly so we
+        # don't have to thread it through every signature.
+        reply = self._dispatch(
+            intent=intent,
+            message=message,
+            started_ts=started_ts,
+            wall_start=wall_start,
+        )
+
+        # Step 3: consolidated chat-log append. Every successful or
+        # errored turn produces one log entry so the next turn's
+        # ChatContext sees the antecedent — including the friendly
+        # apology when dispatch raised. Failures here are non-fatal:
+        # the user's reply path must not break because the log file
+        # could not be written.
+        try:
+            chat_log.append(
+                self._chat_id,
+                user_msg=message,
+                bot_reply=reply.text,
+                intent=intent,
+                vault_root=self._vault_root,
+                clock=self._clock,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("chat_log append failed; continuing")
+
+        return reply
+
+    def _dispatch(
+        self,
+        *,
+        intent: str,
+        message: str,
+        started_ts: datetime,
+        wall_start: float,
+    ) -> "OrchestratorReply":
+        """Route ``intent`` to the right ``_handle_*`` helper and return its reply.
+
+        Pulled out of ``handle_message`` so the per-turn boundary
+        (load ChatContext -> classify -> dispatch -> append chat log)
+        reads top-down without a hundred-line if/elif chain in the
+        middle. Dispatch table:
+
+          - ``journal.query``      -> journal read (retrieval + LLM)
+          - ``journal.*``          -> journal write (capture path)
+          - ``finance.query``      -> finance read (structured query_finance)
+          - ``finance.transaction``-> finance write (extract + append)
+          - ``inventory.{add,consume,adjust}`` -> inventory write
+          - ``inventory.{query,list_low}``    -> inventory read
+          - ``fitness.{workout_log,meal_log,metric_log,profile_update}``
+                                  -> fitness write (logging surface)
+          - ``fitness.query``      -> fitness read (query_fitness)
+          - ``fitness.{workout,nutrition}_plan`` -> fitness plan generation
+          - ``reminder.{add,add_when,cancel}``  -> reminder write
+          - ``reminder.list``      -> reminder read
+          - everything else        -> generic echo (issue #1 fallback)
+        """
         if intent == "journal.query":
             return self._handle_journal_query(
                 intent=intent,
@@ -407,6 +481,39 @@ class Orchestrator:
         )
 
     # -- private ---------------------------------------------------------
+
+    def _load_chat_context(self) -> ChatContext:
+        """Assemble the per-turn ``ChatContext`` from chat log + active session.
+
+        Both reads degrade gracefully — a missing chat log or a fresh
+        session yields empty fields rather than raising. This is the
+        sole I/O entry point for chat-context per turn (every dispatch
+        helper consumes ``self._chat_context``); centralizing it here
+        is what makes the ADR's "load once" discipline enforceable.
+        """
+        try:
+            recent = chat_log.load_recent(
+                self._chat_id, n=5, vault_root=self._vault_root
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("chat_log load_recent failed; using empty context")
+            recent = []
+
+        try:
+            session = session_load(
+                self._chat_id,
+                vault_root=self._vault_root,
+                clock=self._clock,
+            )
+            summary = session.summary or ""
+        except Exception:  # noqa: BLE001
+            logger.exception("session load failed; using empty summary")
+            summary = ""
+
+        return ChatContext(
+            recent_turns=tuple(recent),
+            session_summary=summary,
+        )
 
     def _classify(self, message: str, started_ts: datetime) -> str:
         """Run the classifier and audit-log the result. Returns the intent."""
@@ -550,6 +657,15 @@ class Orchestrator:
             domain="journal",
         )
 
+        # Per ADR + issue #27: fold the recent verbatim turns into the
+        # journal-read prompt so referential follow-ups ("yes, the
+        # earlier note", "what was that one about Tokyo?") resolve
+        # against actual antecedents instead of guessing from
+        # retrieval hits alone.
+        chat_preamble = compose_recent_preamble(
+            self._chat_context.recent_turns
+        )
+
         outcome = "ok"
         error_message: Optional[str] = None
         reply_text = ""
@@ -562,6 +678,7 @@ class Orchestrator:
                 query=message,
                 context_bundle=bundle,
                 invoker=self._invoker,
+                chat_context_preamble=chat_preamble,
             )
             reply_text = result.reply_text
             tokens_in = result.tokens_in
@@ -1173,6 +1290,14 @@ class Orchestrator:
 
         session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
 
+        # Per ADR + issue #27: fold recent verbatim turns into the
+        # plan-generation prompt. End-to-end behavior the issue wants:
+        # *"now do a workout one too"* after a nutrition-plan request
+        # carries the prior plan's framing into the new generation.
+        chat_preamble = compose_recent_preamble(
+            self._chat_context.recent_turns
+        )
+
         outcome = "ok"
         error_message: Optional[str] = None
         reply_text = ""
@@ -1183,6 +1308,7 @@ class Orchestrator:
                 vault_root=self._vault_root,
                 invoker=self._invoker,
                 clock=self._clock,
+                chat_context_preamble=chat_preamble,
             )
         except Exception as err:  # noqa: BLE001
             outcome = "error"
@@ -1218,7 +1344,8 @@ class Orchestrator:
         # prefix — e.g., "Cannot generate a plan — ...") mean nothing
         # was written, so the session stays untouched. Without this,
         # generated plans are invisible to downstream session-aware
-        # features (PRD #22 / issue #24).
+        # features (PRD #22 / issue #24). NOTE: this is the issue-#24
+        # fix — preserved verbatim per #27's instructions.
         if reply_text.startswith(_FITNESS_PLAN_SAVED_PREFIX):
             relative_path = "fitness/plans/" + reply_text[
                 len(_FITNESS_PLAN_SAVED_PREFIX):
@@ -1406,28 +1533,22 @@ class Orchestrator:
     ) -> OrchestratorReply:
         """Issue-#1 fallback: invoke the runner, log, return its text.
 
-        Per ADR ``2026-05-10-chat-context-and-capabilities``, the echo
-        path loads the last 5 verbatim turns from ``kernel.chat_log`` and
-        prepends them to the LLM prompt as a "Recent conversation"
-        preamble — that's what lets *"yes, walk me through it"* resolve
-        to its antecedent. After dispatch (success OR error) the new
-        turn is appended to the log so the next turn sees it.
+        Per the ADR at ``docs/decisions/2026-05-10-chat-context-and-capabilities.md``,
+        the echo path folds the recent verbatim turns into the LLM
+        prompt as a "Recent conversation" preamble — that's what lets
+        *"yes, walk me through it"* resolve to its antecedent.
 
-        Issue #25 wires chat_log into the echo path only — structured
-        handlers gain the same wiring under #27.
+        Issue #25 wired chat_log into the echo path only; issue #27
+        generalized the wiring so every handler benefits. The recent
+        turns are now read off ``self._chat_context`` (loaded once per
+        turn at the top of ``handle_message``) and the per-turn append
+        is consolidated into ``handle_message`` so this handler stays
+        focused on the LLM call itself.
         """
-        # Load prior turns BEFORE the LLM call so they participate in
-        # the prompt. A failure here is non-fatal — degrade to a turn-
-        # local prompt rather than dropping the user's message.
-        try:
-            recent = chat_log.load_recent(
-                self._chat_id, n=5, vault_root=self._vault_root
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("chat_log load_recent failed (echo path); continuing")
-            recent = []
-
-        prompt = _compose_echo_prompt(message=message, recent=recent)
+        prompt = _compose_echo_prompt(
+            message=message,
+            recent=list(self._chat_context.recent_turns),
+        )
 
         outcome = "ok"
         error_message: Optional[str] = None
@@ -1457,42 +1578,19 @@ class Orchestrator:
 
         self._audit_writer(entry, audit_root=self._audit_root)
 
-        # Determine the user-facing reply text up front so we can both
-        # return it AND record it in the chat log. The error branch's
-        # friendly message *is* what the user sees; recording it lets
-        # the next turn see "I asked X, the bot apologized" as context
-        # rather than having no antecedent at all.
-        reply_text = (
-            response.text
-            if response is not None
-            else "Sorry — something went wrong handling that message."
-        )
-
-        # Append AFTER dispatch so the recorded turn carries the actual
-        # bot reply (or the friendly error). A chat-log failure must
-        # not break the user's reply path — log and continue.
-        try:
-            chat_log.append(
-                self._chat_id,
-                user_msg=message,
-                bot_reply=reply_text,
-                intent="",  # echo / fallback path — no routed intent
-                vault_root=self._vault_root,
-                clock=self._clock,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("chat_log append failed (echo path); continuing")
-
         if response is None:
+            # Friendly apology preserves continuity for the next turn —
+            # the consolidated chat_log.append in ``handle_message``
+            # records "user asked X, the bot apologized."
             return OrchestratorReply(
-                text=reply_text,
+                text="Sorry — something went wrong handling that message.",
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,
             )
 
         return OrchestratorReply(
-            text=reply_text,
+            text=response.text,
             tokens_in=response.tokens_in,
             tokens_out=response.tokens_out,
             duration_ms=duration_ms,
