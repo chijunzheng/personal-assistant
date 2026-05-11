@@ -106,3 +106,30 @@ def run_polling_loop(
         application.run_polling()
     finally:
         orchestrator.stop()
+
+
+def _build_default_orchestrator() -> Orchestrator:
+    """Wire a production-default orchestrator: classifier + LLM-backed handlers.
+
+    Loads ``kernel/prompts/system.md`` and hands it to the orchestrator so
+    the per-turn LLM call carries the user-facing system prompt (and the
+    auto-derived ``{capabilities}`` preamble it embeds). Without this the
+    orchestrator would fall back to the legacy tracer string and the
+    capabilities slot would never reach Claude.
+    """
+    from kernel.classifier import Classifier
+    from kernel.claude_runner import load_default_system_prompt
+
+    classifier = Classifier()
+    return Orchestrator(
+        classifier=classifier,
+        system_prompt=load_default_system_prompt(),
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    run_polling_loop(orchestrator=_build_default_orchestrator())
