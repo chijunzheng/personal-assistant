@@ -66,6 +66,13 @@ _REFRESH_STATE_RELATIVE = Path("_index") / ".refresh_state.json"
 # accepts an override via ``config.context_engineering.index_refresh_after_writes``.
 _DEFAULT_INDEX_REFRESH_AFTER_WRITES = 5
 
+# Prefix that ``domains.fitness._plans.generate_plan`` returns on a
+# successful plan write. The orchestrator strips it to recover the
+# saved filename when leaving a session-update trace; refusal replies
+# (no prefix match) intentionally bypass the session update so failed
+# generations don't pollute active_session.md.
+_FITNESS_PLAN_SAVED_PREFIX = "Saved plan to fitness/plans/"
+
 
 class InstanceLockError(RuntimeError):
     """Raised when the kernel's single-instance lock cannot be acquired."""
@@ -1137,6 +1144,24 @@ class Orchestrator:
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,
+            )
+
+        # Leave a one-line trace in the active session ONLY on a real
+        # plan write. Refusal shapes (reply doesn't start with the saved
+        # prefix — e.g., "Cannot generate a plan — ...") mean nothing
+        # was written, so the session stays untouched. Without this,
+        # generated plans are invisible to downstream session-aware
+        # features (PRD #22 / issue #24).
+        if reply_text.startswith(_FITNESS_PLAN_SAVED_PREFIX):
+            relative_path = "fitness/plans/" + reply_text[
+                len(_FITNESS_PLAN_SAVED_PREFIX):
+            ].rstrip(".")
+            kind = "workout" if intent == "fitness.workout_plan" else "nutrition"
+            session_update(
+                session,
+                f"{kind} plan saved at {relative_path}",
+                vault_root=self._vault_root,
+                clock=self._clock,
             )
 
         return OrchestratorReply(

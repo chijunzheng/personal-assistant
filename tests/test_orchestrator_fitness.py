@@ -488,6 +488,197 @@ def test_fitness_query_audit_records_read(
 
 
 # ---------------------------------------------------------------------------
+# fitness.workout_plan / fitness.nutrition_plan -> session_update trace (#24)
+# ---------------------------------------------------------------------------
+
+
+def test_fitness_workout_plan_updates_active_session_with_saved_filename(
+    tmp_path: Path, lock_path: Path
+) -> None:
+    """A successful plan write must leave a one-line trace in active_session.md.
+
+    Other handlers (journal, finance, inventory, reminder, fitness-logging)
+    all call ``session_update`` after dispatch. The plan handler used to be
+    the lone exception, so generated plans were invisible to downstream
+    session-aware features (PRD #22 / issue #24). This test pins that the
+    trace fires exactly once, includes the plan kind, and includes the
+    saved filename.
+    """
+    vault_root = tmp_path / "vault"
+    domains_root = tmp_path / "domains"
+    (domains_root / "fitness").mkdir(parents=True, exist_ok=True)
+    (domains_root / "fitness" / "domain.yaml").write_text(
+        "name: fitness\nintents:\n  - fitness.workout_plan\n", encoding="utf-8"
+    )
+    _seed_profile(vault_root)
+    fit = vault_root / "fitness"
+    fit.mkdir(parents=True, exist_ok=True)
+    (fit / "workouts.jsonl").write_text(
+        json.dumps({"id": "w-x", "date": "2026-04-28", "type": "strength"}) + "\n",
+        encoding="utf-8",
+    )
+    (fit / "metrics.jsonl").write_text("", encoding="utf-8")
+
+    classifier = _build_classifier(domains_root, "fitness.workout_plan")
+
+    orchestrator = Orchestrator(
+        lock=SingleInstanceLock(lock_path),
+        audit_root=vault_root / "_audit",
+        invoker=_stub_invoker(text="## plan body\n"),
+        classifier=classifier,
+        vault_root=vault_root,
+        clock=_fixed_clock,
+        chat_id="test-chat",
+    )
+
+    orchestrator.handle_message("plan today")
+
+    # The plan landed on disk under the expected pattern.
+    plans = list((fit / "plans").glob("2026-04-29-workout-*.md"))
+    assert len(plans) == 1, f"expected one plan file, got {plans}"
+    saved_filename = plans[0].name
+
+    # The session file has a single bullet referencing that filename, with
+    # the kind label ("workout") and the relative vault path.
+    session_md = vault_root / "_index" / "active_session.md"
+    assert session_md.exists()
+    contents = session_md.read_text(encoding="utf-8")
+    assert saved_filename in contents, (
+        f"saved filename {saved_filename!r} missing from session: {contents!r}"
+    )
+    assert "workout plan saved at fitness/plans/" in contents, (
+        f"expected coach-style trace, got: {contents!r}"
+    )
+    # Exactly one trace line for the plan (turn count == 1 -> one bullet).
+    bullets = [
+        line for line in contents.splitlines() if line.strip().startswith("- ")
+    ]
+    plan_bullets = [b for b in bullets if "plan saved at" in b]
+    assert len(plan_bullets) == 1, (
+        f"expected exactly one plan trace, got {plan_bullets}"
+    )
+
+
+def test_fitness_nutrition_plan_updates_active_session_with_kind_label(
+    tmp_path: Path, lock_path: Path
+) -> None:
+    """The nutrition_plan intent leaves a trace tagged ``nutrition`` (not workout)."""
+    vault_root = tmp_path / "vault"
+    domains_root = tmp_path / "domains"
+    (domains_root / "fitness").mkdir(parents=True, exist_ok=True)
+    (domains_root / "fitness" / "domain.yaml").write_text(
+        "name: fitness\nintents:\n  - fitness.nutrition_plan\n", encoding="utf-8"
+    )
+    profile = _full_profile()
+    profile["target_calories_kcal"] = 2000
+    profile["target_protein_g"] = 160
+    _seed_profile(vault_root, profile)
+    fit = vault_root / "fitness"
+    fit.mkdir(parents=True, exist_ok=True)
+    (fit / "meals.jsonl").write_text("", encoding="utf-8")
+    (fit / "metrics.jsonl").write_text("", encoding="utf-8")
+    inventory = vault_root / "inventory"
+    inventory.mkdir(parents=True, exist_ok=True)
+    (inventory / "state.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "chicken breast": {"quantity": 500, "unit": "g"},
+                "rice": {"quantity": 1000, "unit": "g"},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    classifier = _build_classifier(domains_root, "fitness.nutrition_plan")
+
+    orchestrator = Orchestrator(
+        lock=SingleInstanceLock(lock_path),
+        audit_root=vault_root / "_audit",
+        invoker=_stub_invoker(text="## meals\n- breakfast\n"),
+        classifier=classifier,
+        vault_root=vault_root,
+        clock=_fixed_clock,
+        chat_id="test-chat",
+    )
+
+    orchestrator.handle_message("what should I eat?")
+
+    plans = list((fit / "plans").glob("2026-04-29-nutrition-*.md"))
+    assert len(plans) == 1, f"expected one nutrition plan, got {plans}"
+
+    session_md = vault_root / "_index" / "active_session.md"
+    contents = session_md.read_text(encoding="utf-8")
+    assert "nutrition plan saved at fitness/plans/" in contents
+    assert "workout plan saved at" not in contents
+
+
+def test_fitness_plan_refusal_does_not_update_active_session(
+    tmp_path: Path, lock_path: Path
+) -> None:
+    """A profile-TODO refusal writes no plan AND leaves no session trace."""
+    vault_root = tmp_path / "vault"
+    domains_root = tmp_path / "domains"
+    (domains_root / "fitness").mkdir(parents=True, exist_ok=True)
+    (domains_root / "fitness" / "domain.yaml").write_text(
+        "name: fitness\nintents:\n  - fitness.workout_plan\n", encoding="utf-8"
+    )
+    # Profile with explicit TODO holes -> handler refuses.
+    fit = vault_root / "fitness"
+    fit.mkdir(parents=True, exist_ok=True)
+    (fit / "profile.yaml").write_text(
+        "sex: TODO\n"
+        "date_of_birth: TODO\n"
+        "height_cm: TODO\n"
+        "weight_kg: TODO\n"
+        "goal: TODO\n"
+        "target_weight_kg: TODO\n"
+        "target_date: null\n"
+        "activity_level: moderate\n"
+        "weekly_training_days: 4\n"
+        "equipment_available: [bw]\n"
+        "dietary_restrictions: []\n"
+        "allergies: []\n"
+        "injuries_active: []\n"
+        "injuries_history: []\n"
+        "preferences:\n  enjoys: []\n  avoids: []\n"
+        "target_calories_kcal: null\n"
+        "target_protein_g: null\n"
+        "target_carbs_g: null\n"
+        "target_fat_g: null\n"
+        "plan_cadence: daily\n",
+        encoding="utf-8",
+    )
+
+    classifier = _build_classifier(domains_root, "fitness.workout_plan")
+
+    orchestrator = Orchestrator(
+        lock=SingleInstanceLock(lock_path),
+        audit_root=vault_root / "_audit",
+        invoker=_stub_invoker(text="## plan body\n"),
+        classifier=classifier,
+        vault_root=vault_root,
+        clock=_fixed_clock,
+        chat_id="test-chat",
+    )
+
+    orchestrator.handle_message("plan today")
+
+    # No plan was written.
+    plans_dir = fit / "plans"
+    assert not plans_dir.exists() or not list(plans_dir.glob("*.md"))
+
+    # The session file may exist (load_or_create materializes it) but must
+    # contain NO plan-trace line.
+    session_md = vault_root / "_index" / "active_session.md"
+    if session_md.exists():
+        contents = session_md.read_text(encoding="utf-8")
+        assert "plan saved at" not in contents, (
+            f"refusal must not leave a plan trace, got: {contents!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # isolation
 # ---------------------------------------------------------------------------
 
