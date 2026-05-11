@@ -280,6 +280,11 @@ class Orchestrator:
         # dispatcher reusing the orchestrator) sees a usable value
         # rather than ``AttributeError``.
         self._chat_context: ChatContext = ChatContext()
+        # Mid-turn progress sender; set per-turn by ``handle_message``
+        # from the Telegram bridge. ``None`` for eval/CLI callers and for
+        # tests that call ``_handle_*`` directly without going through
+        # ``handle_message``.
+        self._send_progress: Optional[Callable[[str], None]] = None
 
     def _substitute_capabilities(self, system_prompt: str) -> str:
         """Replace ``{capabilities}`` in the supplied system prompt.
@@ -303,7 +308,12 @@ class Orchestrator:
         """Release the single-instance lock — call once at process shutdown."""
         self._lock.release()
 
-    def handle_message(self, message: str) -> OrchestratorReply:
+    def handle_message(
+        self,
+        message: str,
+        *,
+        send_progress: Optional[Callable[[str], None]] = None,
+    ) -> OrchestratorReply:
         """Run one turn: classify, dispatch, audit, reply.
 
         Per the ADR (chat-context section), the orchestrator loads a
@@ -315,9 +325,18 @@ class Orchestrator:
         the bottom records the turn — that consolidation means every
         handler benefits from chat-context continuity, not just the
         echo fallback (issue #27).
+
+        ``send_progress`` is the bridge-supplied callable that schedules
+        an immediate Telegram reply on the bot's event loop. Long-running
+        handlers (plan generation) push a coach-voice ack via this so
+        the user knows the bot heard them while the 10-30s LLM call is
+        in flight. Eval / CLI callers pass ``None`` (the default).
         """
         started_ts = self._clock()
         wall_start = time.monotonic()
+        # Stash so dispatch helpers can pick it up without threading the
+        # parameter through every signature.
+        self._send_progress = send_progress
 
         # Step 0: assemble the per-turn ChatContext exactly once. Both
         # sub-loads degrade gracefully — a missing chat log or a fresh
@@ -1236,10 +1255,30 @@ class Orchestrator:
         The fitness read does its own structured aggregation via
         ``query_fitness`` (no retrieval bundle is needed for a numeric
         answer). The audit entry records the intent + outcome.
+
+        Referential follow-up (PRD #22): if ``classifier-with-context``
+        routed something like "Walk me through it" here right after a
+        plan write, structured aggregation is useless — the user wants
+        the bot to walk through the recently-saved plan. We detect this
+        shape (short message + walkthrough keywords + a "plan saved at
+        ..." trace in ``active_session.md``) and reroute via the LLM.
         """
         from domains.fitness.handler import read as fitness_read
 
         session = session_load(self._chat_id, vault_root=self._vault_root, clock=self._clock)
+
+        if _looks_like_walkthrough_followup(message):
+            plan_rel = _extract_recent_plan_path(session.summary)
+            if plan_rel:
+                walkthrough = self._walk_through_recent_plan(
+                    message=message,
+                    plan_rel_path=plan_rel,
+                    started_ts=started_ts,
+                    wall_start=wall_start,
+                    session=session,
+                )
+                if walkthrough is not None:
+                    return walkthrough
 
         outcome = "ok"
         error_message: Optional[str] = None
@@ -1288,6 +1327,85 @@ class Orchestrator:
             duration_ms=duration_ms,
         )
 
+    def _walk_through_recent_plan(
+        self,
+        *,
+        message: str,
+        plan_rel_path: str,
+        started_ts: datetime,
+        wall_start: float,
+        session: Session,
+    ) -> Optional[OrchestratorReply]:
+        """LLM walkthrough of a recently-saved plan.
+
+        Reads the plan file under ``self._vault_root``, hands it to the
+        invoker with the chat-context preamble + a short instruction to
+        walk Jason through it in coach voice. Returns ``None`` if the
+        plan file is missing — the caller falls back to structured query.
+        """
+        plan_path = self._vault_root / plan_rel_path
+        if not plan_path.exists():
+            return None
+        try:
+            plan_body = plan_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+        chat_preamble = compose_recent_preamble(self._chat_context.recent_turns)
+        prompt = (
+            f"{chat_preamble}"
+            f"Jason just said: {message!r}.\n\n"
+            f"Walk him through the plan below in coach voice (warm, concise, "
+            f"phone-readable). Highlight 2-3 things he should pay attention to "
+            f"first. End with one question that helps him commit to action. "
+            f"Do NOT dump the plan back at him verbatim — synthesize.\n\n"
+            f"## Plan at {plan_rel_path}\n\n{plan_body}\n"
+        )
+
+        outcome = "ok"
+        error_message: Optional[str] = None
+        response: Optional[ClaudeResponse] = None
+        try:
+            response = self._invoker(prompt, system_prompt=self._system_prompt)
+        except ClaudeRunnerError as err:
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "read",
+            "actor": "kernel.orchestrator",
+            "domain": "fitness",
+            "intent": "fitness.plan_walkthrough",
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+            "session_id": session.session_id,
+            "path": str(plan_path),
+        }
+        if response is not None:
+            entry["tokens_in"] = response.tokens_in
+            entry["tokens_out"] = response.tokens_out
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
+
+        if response is None:
+            return OrchestratorReply(
+                text="Sorry — couldn't walk through that plan just now.",
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=duration_ms,
+            )
+
+        return OrchestratorReply(
+            text=response.text,
+            tokens_in=response.tokens_in,
+            tokens_out=response.tokens_out,
+            duration_ms=duration_ms,
+        )
+
     def _handle_fitness_plan(
         self,
         *,
@@ -1315,6 +1433,15 @@ class Orchestrator:
         chat_preamble = compose_recent_preamble(
             self._chat_context.recent_turns
         )
+
+        # Coach-voice ack so the user knows we heard them while the
+        # 10-30s LLM call is in flight. Defensive: send_progress is None
+        # for eval/CLI callers and may raise if the bridge is unhealthy.
+        if self._send_progress is not None:
+            try:
+                self._send_progress(_fitness_plan_ack(intent))
+            except Exception:  # noqa: BLE001
+                logger.warning("send_progress failed for fitness plan ack", exc_info=True)
 
         outcome = "ok"
         error_message: Optional[str] = None
@@ -1377,7 +1504,7 @@ class Orchestrator:
             )
 
         return OrchestratorReply(
-            text=reply_text,
+            text=_warm_fitness_plan_reply(intent=intent, raw_reply=reply_text),
             tokens_in=0,
             tokens_out=0,
             duration_ms=duration_ms,
@@ -1731,3 +1858,92 @@ class Orchestrator:
             self._write_refresh_state({"writes_since_last_refresh": 0})
         else:
             self._write_refresh_state({"writes_since_last_refresh": count})
+
+
+# ---------------------------------------------------------------------------
+# Coach-voice helpers for fitness plan generation.
+#
+# The bare ``"Saved plan to fitness/plans/<file>.md."`` string returned by
+# ``domains.fitness._plans.generate_plan`` reads like a CRUD app. These
+# helpers (1) push an immediate ack via the bridge's ``send_progress``
+# callback so the user knows the bot heard them while the 10-30s LLM call
+# is in flight, and (2) warm the final reply into coach voice.
+# ---------------------------------------------------------------------------
+
+
+def _fitness_plan_ack(intent: str) -> str:
+    """Return the coach-voice ack text for the given plan intent."""
+    if intent == "fitness.workout_plan":
+        return "Yes! Pulling your last 14 days of training and recent journal notes — one sec… 💪"
+    return "On it! Checking your meals, weight trend, and what's in the pantry — one sec… 🥗"
+
+
+def _warm_fitness_plan_reply(*, intent: str, raw_reply: str) -> str:
+    """Wrap the bare 'Saved plan to ...' string in coach voice.
+
+    Refusal replies (anything not starting with the saved-prefix — e.g.,
+    "Cannot generate a plan — ..." when the profile has TODO holes) pass
+    through unchanged so the user sees the actionable original.
+    """
+    if not raw_reply.startswith(_FITNESS_PLAN_SAVED_PREFIX):
+        return raw_reply
+    filename = raw_reply[len(_FITNESS_PLAN_SAVED_PREFIX):].rstrip(".")
+    kind = "workout" if intent == "fitness.workout_plan" else "nutrition"
+    return (
+        f"Done! 🎯 Saved your {kind} plan to fitness/plans/{filename} — "
+        "open it in Obsidian to take a look. Want me to walk you through it?"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Walkthrough detection — when the user says "walk me through it" / "tell me
+# more" / "yes" right after a plan was generated, ``classifier-with-context``
+# (#28) routes this to ``fitness.query``. But that handler runs structured
+# aggregation, which is useless for a walkthrough request. These helpers let
+# the query handler detect referential follow-ups and reroute through an LLM
+# read of the just-saved plan file.
+# ---------------------------------------------------------------------------
+
+
+_WALKTHROUGH_KEYWORDS = (
+    "walk me through",
+    "tell me more",
+    "explain",
+    "talk me through",
+    "go on",
+    "yes",
+    "yeah",
+    "sure",
+    "ok",
+    "okay",
+    "please",
+    "what's in it",
+    "what is in it",
+    "break it down",
+)
+
+
+def _looks_like_walkthrough_followup(message: str) -> bool:
+    """Heuristic: is this a short referential follow-up rather than a query?
+
+    Short (< 60 chars) + contains a walkthrough keyword OR is purely a yes-shape.
+    """
+    text = message.strip().lower()
+    if not text or len(text) > 60:
+        return False
+    return any(kw in text for kw in _WALKTHROUGH_KEYWORDS)
+
+
+def _extract_recent_plan_path(session_summary: str) -> Optional[str]:
+    """Return the last 'plan saved at <relative_path>' note from the session, if any.
+
+    Session-summary lines from issue #24 look like
+    ``- nutrition plan saved at fitness/plans/2026-05-11-...md``. We walk the
+    body bottom-up and return the most recent match.
+    """
+    for line in reversed(session_summary.splitlines()):
+        stripped = line.strip().lstrip("- ").strip()
+        marker = " plan saved at "
+        if marker in stripped:
+            return stripped.split(marker, 1)[1].strip()
+    return None
