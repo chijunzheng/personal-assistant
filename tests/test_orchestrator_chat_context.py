@@ -21,10 +21,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from unittest.mock import Mock
 
 import yaml
 
 from kernel import chat_log
+from kernel.chat_context import ChatContext
 from kernel.classifier import Classifier
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError
 from kernel.orchestrator import Orchestrator, SingleInstanceLock
@@ -459,3 +461,68 @@ def test_journal_query_audit_entry_unchanged_by_chat_context(
     assert read_entries[0]["domain"] == "journal"
     assert read_entries[0]["intent"] == "journal.query"
     assert read_entries[0]["outcome"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# 6. Orchestrator threads its loaded ChatContext into Classifier.classify
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_passes_loaded_chat_context_into_classifier(
+    tmp_path: Path, lock_path: Path
+) -> None:
+    """``Classifier.classify`` is called with the same ``ChatContext`` instance.
+
+    Issue #28's whole point is that the per-turn ``ChatContext`` the
+    orchestrator already loads (#27) reaches the classifier so
+    referential follow-ups resolve. This test pins the exact wiring:
+    the kwarg is present, and the value is the *identical* instance
+    the orchestrator stashed on ``self._chat_context`` — not a fresh
+    one rebuilt mid-dispatch.
+    """
+    vault_root = tmp_path / "vault"
+    chat_id = "chat-passthrough"
+
+    # Seed one prior turn so the loaded ChatContext is non-empty —
+    # makes the identity assertion meaningful even if the empty case
+    # short-circuits anywhere.
+    chat_log.append(
+        chat_id,
+        user_msg="generate me a nutrition plan for today",
+        bot_reply="Done! Saved your nutrition plan to fitness/plans/foo.md.",
+        intent="fitness.nutrition_plan",
+        vault_root=vault_root,
+        clock=_fixed_clock(datetime(2026, 5, 10, 8, 0, 0, tzinfo=timezone.utc)),
+    )
+
+    classifier_stub = Mock()
+    classifier_stub.classify = Mock(return_value="_inbox.fallback")
+
+    orchestrator = Orchestrator(
+        lock=SingleInstanceLock(lock_path),
+        audit_root=vault_root / "_audit",
+        vault_root=vault_root,
+        invoker=_RecordingInvoker(text="ok"),
+        classifier=classifier_stub,
+        chat_id=chat_id,
+        clock=_fixed_clock(datetime(2026, 5, 10, 8, 5, 0, tzinfo=timezone.utc)),
+    )
+
+    orchestrator.handle_message("Yes, walk me through it")
+
+    # Classifier.classify must have been called exactly once, with
+    # chat_context= keyword carrying the same instance the orchestrator
+    # loaded (and stashed on self._chat_context).
+    assert classifier_stub.classify.call_count == 1
+    call = classifier_stub.classify.call_args
+    assert call.args == ("Yes, walk me through it",)
+    assert "chat_context" in call.kwargs
+    passed = call.kwargs["chat_context"]
+    assert isinstance(passed, ChatContext)
+    assert passed is orchestrator._chat_context
+    # And the loaded context must have actually carried the seeded turn —
+    # otherwise the whole pass-through is moot.
+    assert len(passed.recent_turns) == 1
+    assert passed.recent_turns[0].user_msg == (
+        "generate me a nutrition plan for today"
+    )

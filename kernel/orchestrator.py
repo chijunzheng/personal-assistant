@@ -327,10 +327,13 @@ class Orchestrator:
         self._chat_context = self._load_chat_context()
 
         # Step 1: classify (if a classifier is wired). With no classifier we
-        # preserve the issue-#1 echo path verbatim.
-        # TODO(#28): pass ``self._chat_context`` into ``self._classify`` once
-        # the classifier prompt template grows a ``{recent_turns}`` slot.
-        intent = self._classify(message, started_ts)
+        # preserve the issue-#1 echo path verbatim. The per-turn ChatContext
+        # is threaded into the classifier so referential follow-ups
+        # ("yes, walk me through it") resolve to a real domain intent
+        # instead of falling through to FALLBACK_INTENT (issue #28).
+        intent = self._classify(
+            message, started_ts, chat_context=self._chat_context
+        )
 
         # Step 2: dispatch on the classified intent. Per-intent helpers
         # pick up the per-turn ``self._chat_context`` directly so we
@@ -515,8 +518,21 @@ class Orchestrator:
             session_summary=summary,
         )
 
-    def _classify(self, message: str, started_ts: datetime) -> str:
-        """Run the classifier and audit-log the result. Returns the intent."""
+    def _classify(
+        self,
+        message: str,
+        started_ts: datetime,
+        *,
+        chat_context: Optional[ChatContext] = None,
+    ) -> str:
+        """Run the classifier and audit-log the result. Returns the intent.
+
+        ``chat_context`` is threaded through to ``Classifier.classify`` so
+        referential follow-ups can resolve against verbatim antecedents
+        (issue #28). Defaults to ``None`` so any future caller wiring
+        bypassing ``handle_message`` (e.g., a reminder dispatcher) still
+        gets the pre-#28 behavior without surprises.
+        """
         if self._classifier is None:
             return ""  # echo path; no classification performed
 
@@ -525,7 +541,9 @@ class Orchestrator:
         error_message: Optional[str] = None
         intent = FALLBACK_INTENT
         try:
-            intent = self._classifier.classify(message)
+            intent = self._classifier.classify(
+                message, chat_context=chat_context
+            )
         except Exception as err:  # noqa: BLE001
             outcome = "error"
             error_message = str(err)

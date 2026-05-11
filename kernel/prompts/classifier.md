@@ -18,6 +18,22 @@ list.
    only chosen when the user is explicitly asking to be reminded. Do not
    route generic "remind me later" filler into reminder.
 
+# Recent conversation
+
+If a ``## Recent conversation`` block precedes the rules below, treat it
+as the immediate antecedent of the user's current message. If the user's
+message is a short reply that only makes sense in the context of the
+prior turn (e.g., "yes", "sure", "go ahead", "tell me more", "walk me
+through it", "do that one too", "now make a workout one"), use the
+Recent conversation block to infer the right domain intent — do not
+classify these to ``_inbox.fallback``. The bot's prior reply is the
+strongest signal: if it just saved a nutrition plan and the user replies
+*"yes, walk me through it"*, the intent is ``fitness.query`` (or whatever
+registered intent best matches "explain that"); if it just confirmed a
+finance write and the user says *"and one more for $5 at coffee"*, the
+intent is ``finance.transaction``. Only fall back to ``_inbox.fallback``
+when the prior turn provides no resolving signal either.
+
 # Examples
 
 - "interesting thought about consciousness and tiered memory" -> journal.capture
