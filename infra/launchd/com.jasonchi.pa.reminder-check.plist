@@ -27,6 +27,8 @@
     <dict>
         <key>TELEGRAM_BOT_TOKEN</key>
         <string>__TELEGRAM_BOT_TOKEN__</string>
+        <key>VAULT_ROOT</key>
+        <string>__VAULT_ROOT__</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>

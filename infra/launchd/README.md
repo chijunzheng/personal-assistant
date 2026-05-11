@@ -23,16 +23,20 @@ on a developer laptop where launchd isn't in the picture.
 
 ## Install
 
-The plists ship with two placeholder tokens:
+The plists ship with three placeholder tokens:
 
 - `__PROJECT_ROOT__` — absolute path to your local clone (no trailing slash)
 - `__TELEGRAM_BOT_TOKEN__` — the bot token from `@BotFather`
+- `__VAULT_ROOT__` — absolute path to the Obsidian vault on disk
+  (production: `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Jason/PersonalAssistant`).
+  See `docs/decisions/2026-05-09-vault-on-icloud.md` for why iCloud and not Drive.
 
 Substitute and copy with this snippet (run from the repo root):
 
 ```bash
 PROJECT_ROOT="$(pwd)"
 TELEGRAM_BOT_TOKEN="<paste-real-token>"
+VAULT_ROOT="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Jason/PersonalAssistant"
 
 # Render every plist into ~/Library/LaunchAgents
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -41,6 +45,7 @@ for plist in infra/launchd/com.jasonchi.pa.*.plist; do
   sed \
     -e "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" \
     -e "s|__TELEGRAM_BOT_TOKEN__|$TELEGRAM_BOT_TOKEN|g" \
+    -e "s|__VAULT_ROOT__|$VAULT_ROOT|g" \
     "$plist" > "$out"
 done
 ```
@@ -106,12 +111,27 @@ launchctl load -w "$HOME/Library/LaunchAgents/com.jasonchi.pa.bot.plist"
 
 ### macOS Full Disk Access for the vault
 
-The vault lives in `~/Library/CloudStorage/GoogleDrive-.../...`, which
-sits behind macOS's app-sandbox protections. Grant the Python interpreter
-(or the Terminal you used to install) **Full Disk Access** in
+The vault lives in `~/Library/Mobile Documents/iCloud~md~obsidian/...`,
+which sits behind macOS's app-sandbox protections. Grant the Python
+interpreter (or the Terminal you used to install) **Full Disk Access** in
 `System Settings → Privacy & Security → Full Disk Access`, otherwise
 launchd-spawned Python will see permission errors when reading or writing
 vault files.
+
+### iCloud sync caveats (deferred)
+
+`kernel/SYNC.md` was written assuming Google Drive Desktop. Two iCloud
+specifics are NOT yet handled by the kernel:
+
+1. **Conflict naming** — `kernel/conflict_watcher.py` globs Drive's
+   `(Conflict YYYY-MM-DD HH-MM)` pattern. iCloud uses `<filename> 2.md`
+   or `<host>'s conflicted copy.md`. Conflicts produced by iCloud will be
+   **silently ignored** until the watcher is updated.
+2. **`.icloud` placeholder files** — with iCloud Optimize Mac Storage
+   on, evicted files appear as `.icloud` stubs. `Path.exists()` returns
+   True but `read_text()` returns binary metadata, not the file content.
+   Disable Optimize for the `Jason/PersonalAssistant` folder, or pin
+   downloads explicitly.
 
 ### `python3.12` discovery
 

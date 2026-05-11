@@ -45,8 +45,10 @@ __all__ = [
 
 
 DEFAULT_DOMAINS_ROOT = Path("domains")
-DEFAULT_VAULT_ROOT = Path("vault")
-DEFAULT_AUDIT_ROOT = Path("vault/_audit")
+# Same VAULT_ROOT env var as the orchestrator so launchd jobs and the bot
+# agree on where the vault lives. See docs/decisions/2026-05-09-vault-on-icloud.md.
+DEFAULT_VAULT_ROOT = Path(os.environ.get("VAULT_ROOT", "vault"))
+DEFAULT_AUDIT_ROOT = DEFAULT_VAULT_ROOT / "_audit"
 DEFAULT_INBOX_ARCHIVE_AFTER_WEEKS = 4
 
 _REMINDER_EVENTS_RELATIVE = Path("reminder") / "events.jsonl"

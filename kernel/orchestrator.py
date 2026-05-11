@@ -56,8 +56,12 @@ __all__ = [
 
 
 DEFAULT_LOCK_PATH = Path("/tmp/personal-assistant.lock")
-DEFAULT_AUDIT_ROOT = Path("vault/_audit")
-DEFAULT_VAULT_ROOT = Path("vault")
+# Vault location is overridable via the ``VAULT_ROOT`` environment variable so
+# the same code path serves dev (relative ``vault/``), production (iCloud
+# Obsidian subfolder), and tests (tmp_path) without a config-file change.
+# See docs/decisions/2026-05-09-vault-on-icloud.md.
+DEFAULT_VAULT_ROOT = Path(os.environ.get("VAULT_ROOT", "vault"))
+DEFAULT_AUDIT_ROOT = DEFAULT_VAULT_ROOT / "_audit"
 DEFAULT_CHAT_ID = "default"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise personal-assistant tracer. Reply briefly and helpfully."
