@@ -3,6 +3,8 @@ description: "Workout + nutrition tracker with adaptive plan generation. The
   'learn over time' loop is in-context: every plan request reads recent logs
   + profile + journal cross-refs, no fine-tuning, no embeddings."
 
+description_user_facing: "Track workouts, meals, weight, and generate adaptive workout / nutrition plans."
+
 intents:
   - fitness.workout_log       # "did 5x5 squats at 100kg, 3x10 rdl, 20min bike"
   - fitness.workout_plan      # "what should I train today?"
@@ -11,6 +13,29 @@ intents:
   - fitness.metric_log        # "weighed in at 78.4 this morning"
   - fitness.profile_update    # "I want to switch to a cut"
   - fitness.query             # "how often did I train last month?"
+
+intent_examples:
+  fitness.workout_log:
+    - "did 5x5 squats at 100kg, 3x10 rdl, 20min bike"
+    - "ran 5k this morning, easy pace"
+  fitness.workout_plan:
+    - "what should I train today?"
+    - "build me a push/pull/legs week"
+  fitness.meal_log:
+    - "had 3 eggs and 2 slices toast for breakfast"
+    - "lunch was chicken rice and broccoli"
+  fitness.nutrition_plan:
+    - "what should I eat today?"
+    - "plan my meals for the week on a cut"
+  fitness.metric_log:
+    - "weighed in at 78.4 this morning"
+    - "resting heart rate 58 today"
+  fitness.profile_update:
+    - "I want to switch to a cut"
+    - "bumping training to 5 days a week"
+  fitness.query:
+    - "how often did I train last month?"
+    - "what's my average protein intake this week?"
 
 storage:
   type: hybrid                # YAML state + JSONL event logs + markdown plans

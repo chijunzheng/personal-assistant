@@ -1,11 +1,27 @@
 name: reminder
 description: "Scheduled and state-derived reminders. Unified dispatcher."
 
+description_user_facing: "Set time-based or condition-based reminders, list them, and cancel ones you no longer need."
+
 intents:
   - reminder.add        # "remind me to call mom on Sunday at 6pm"
   - reminder.add_when   # "remind me when I run out of AAA batteries"
   - reminder.list       # "what reminders do I have?"
   - reminder.cancel     # "cancel the call mom reminder"
+
+intent_examples:
+  reminder.add:
+    - "remind me to call mom tomorrow at 6pm"
+    - "ping me Friday morning to submit the report"
+  reminder.add_when:
+    - "remind me when I run out of AAA batteries"
+    - "tell me when my weight drops below 75kg"
+  reminder.list:
+    - "what reminders do I have?"
+    - "show me my upcoming reminders"
+  reminder.cancel:
+    - "cancel the call mom reminder"
+    - "drop the Friday report reminder"
 
 storage:
   type: jsonl

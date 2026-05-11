@@ -37,6 +37,7 @@ from typing import Callable, Optional, Protocol
 
 from kernel import chat_log
 from kernel.audit import write_audit_entry
+from kernel.capabilities import build_capabilities_preamble
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError, invoke as claude_invoke
 from kernel.classifier import Classifier, FALLBACK_INTENT
 from kernel.index import refresh as index_refresh_default
@@ -61,6 +62,17 @@ DEFAULT_CHAT_ID = "default"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise personal-assistant tracer. Reply briefly and helpfully."
 )
+# Project-default domains root used to derive the user-facing capabilities
+# preamble. Tests pass an explicit ``domains_root`` so this default only
+# kicks in production. Substitution is one-shot at orchestrator construction
+# (the result is deterministic for a given filesystem state).
+DEFAULT_DOMAINS_ROOT = Path("domains")
+# Substitution token in ``kernel/prompts/system.md`` that is replaced with
+# the auto-derived capabilities preamble at orchestrator construction time.
+# Kept here (not in ``kernel.capabilities``) because the substitution is the
+# orchestrator's responsibility -- the capabilities module just renders the
+# block.
+_CAPABILITIES_PLACEHOLDER = "{capabilities}"
 
 # Where the writes-since-last-refresh counter is persisted. Lives under
 # ``vault/_index/`` next to INDEX.md so it shares the same Drive sync scope.
@@ -202,6 +214,7 @@ class Orchestrator:
         config: Optional[dict] = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         chat_id: str = DEFAULT_CHAT_ID,
+        domains_root: str | os.PathLike[str] = DEFAULT_DOMAINS_ROOT,
         index_refresh: Optional[Callable[..., object]] = None,
         finance_extractor: Optional[Callable[[str], list]] = None,
         finance_query_parser: Optional[Callable[[str], dict]] = None,
@@ -220,7 +233,18 @@ class Orchestrator:
         self._clock = clock or (lambda: datetime.now(tz=timezone.utc))
         self._config_label = config_label
         self._config = config or {}
-        self._system_prompt = system_prompt
+        # Capabilities substitution: replace the ``{capabilities}`` token in
+        # the supplied system prompt with the auto-derived preamble. Done
+        # once at construction time -- the result is deterministic for a
+        # given filesystem state (ADR 2026-05-10), so per-turn re-rendering
+        # would just burn cycles. Substitution is a no-op for system prompts
+        # that don't contain the token (e.g., the legacy tracer default), so
+        # callers passing a hand-written prompt aren't surprised.
+        # ``claude_runner.invoke`` itself is unchanged: substitution belongs
+        # at the kernel boundary that knows about ``domains_root``, not in
+        # the public LLM-runner API.
+        self._domains_root = Path(domains_root)
+        self._system_prompt = self._substitute_capabilities(system_prompt)
         self._chat_id = chat_id
         # Pluggable index refresh entry point (default: kernel.index.refresh).
         # Tests inject a spy that wraps the real refresh; production uses the
@@ -246,6 +270,20 @@ class Orchestrator:
         # ``(message, intent)`` because the same plugin handles add /
         # add_when / cancel with different output shapes.
         self._reminder_extractor = reminder_extractor
+
+    def _substitute_capabilities(self, system_prompt: str) -> str:
+        """Replace ``{capabilities}`` in the supplied system prompt.
+
+        Done once at construction time. The capabilities preamble is
+        deterministic for a given ``domains_root`` filesystem state, so a
+        per-turn re-render would just burn cycles. Returns the prompt
+        unchanged when the placeholder is absent so callers passing a
+        hand-written prompt (or the legacy tracer default) aren't surprised.
+        """
+        if _CAPABILITIES_PLACEHOLDER not in system_prompt:
+            return system_prompt
+        preamble = build_capabilities_preamble(self._domains_root)
+        return system_prompt.replace(_CAPABILITIES_PLACEHOLDER, preamble)
 
     def start(self) -> None:
         """Acquire the single-instance lock — call once at process start."""

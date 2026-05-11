@@ -110,3 +110,67 @@ def test_handle_message_logs_error_outcome_when_runner_fails(
     )
     assert record["outcome"] == "error"
     assert "subprocess crashed" in record["error"]
+
+
+def test_capabilities_placeholder_substituted_before_invoker(
+    tmp_path: Path, lock_path: Path
+) -> None:
+    """The ``{capabilities}`` slot is filled before the LLM call, not at run time.
+
+    This pins the contract that ``claude_runner.invoke`` always receives a
+    ready-to-go system prompt -- substitution belongs at the orchestrator
+    level (it knows about ``domains_root``), not inside the runner. Failing
+    this test means the bot would surface a literal ``{capabilities}`` to
+    Claude, defeating the whole capabilities preamble.
+    """
+    import yaml
+
+    domains_root = tmp_path / "domains"
+    domains_root.mkdir()
+    fitness_dir = domains_root / "fitness"
+    fitness_dir.mkdir()
+    (fitness_dir / "domain.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "fitness",
+                "description_user_facing": "Track workouts and adapt plans.",
+                "intents": ["fitness.workout_log"],
+                "intent_examples": {"fitness.workout_log": ["did 5x5 squats"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict = {}
+
+    def _invoker(prompt, *, system_prompt=None):
+        # Stash the system prompt the runner would have seen; the
+        # orchestrator must have substituted the placeholder by now.
+        captured["system_prompt"] = system_prompt
+        return ClaudeResponse(
+            text="ok",
+            tokens_in=1,
+            tokens_out=1,
+            raw={"prompt": prompt, "system_prompt": system_prompt},
+        )
+
+    audit_root = tmp_path / "audit"
+    orchestrator = Orchestrator(
+        lock=SingleInstanceLock(lock_path),
+        audit_root=audit_root,
+        invoker=_invoker,
+        domains_root=domains_root,
+        # Pass a system prompt that contains the placeholder so we exercise
+        # the substitution path rather than the legacy tracer default.
+        system_prompt="Coach voice prompt.\n\n{capabilities}\n\nEnd.",
+    )
+
+    orchestrator.handle_message("what can you do?")
+
+    assert "system_prompt" in captured
+    sent_prompt = captured["system_prompt"]
+    assert sent_prompt is not None
+    # Substitution happened: the literal token is gone, the description
+    # the user would actually recognize is present.
+    assert "{capabilities}" not in sent_prompt
+    assert "Track workouts and adapt plans." in sent_prompt

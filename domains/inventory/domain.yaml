@@ -1,12 +1,31 @@
 name: inventory
 description: "Household items in fridge, pantry, storage. State + event log."
 
+description_user_facing: "Keep tabs on what's in the fridge, pantry, and storage, and flag items running low."
+
 intents:
   - inventory.add        # "bought 2 milks at Costco"
   - inventory.consume    # "just used the last battery"
   - inventory.adjust     # "actually I miscounted, only 3 eggs left"
   - inventory.query      # "do I still have AAA batteries?"
   - inventory.list_low   # "what's running low?"
+
+intent_examples:
+  inventory.add:
+    - "bought 2 milks at Costco"
+    - "add 6 eggs to inventory"
+  inventory.consume:
+    - "just used the last battery"
+    - "finished the milk this morning"
+  inventory.adjust:
+    - "actually I miscounted, only 3 eggs left"
+    - "fix the rice count to 1 bag"
+  inventory.query:
+    - "do I still have AAA batteries?"
+    - "how much pasta is in the pantry?"
+  inventory.list_low:
+    - "what's running low?"
+    - "what should I add to the grocery list?"
 
 storage:
   type: hybrid

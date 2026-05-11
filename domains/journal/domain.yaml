@@ -1,9 +1,19 @@
 name: journal
 description: "Substantive thoughts, learnings, ideas worth persisting and linking"
 
+description_user_facing: "Save thoughts, ideas, and learnings, and look back at what you've written before."
+
 intents:
   - journal.capture       # user dumped a thought worth saving
   - journal.query         # user is asking what they previously thought/learned
+
+intent_examples:
+  journal.capture:
+    - "had a thought about how memory tiers work in agents"
+    - "reflection: today went well because I batched deep work first"
+  journal.query:
+    - "what was I thinking about agents last week?"
+    - "pull up my notes on the Tokyo trip planning"
 
 storage:
   type: markdown

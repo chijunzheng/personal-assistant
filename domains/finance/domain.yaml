@@ -1,11 +1,27 @@
 name: finance
 description: "Transactions, spending queries, statement uploads"
 
+description_user_facing: "Track expenses, log statements, and answer spending questions by category and time range."
+
 intents:
   - finance.transaction  # single transaction or batch from a statement
   - finance.query        # read-only question about spending
   - finance.budget       # read/write budget targets
   - finance.subscription # detect recurring charges
+
+intent_examples:
+  finance.transaction:
+    - "paid 47 at the grocery store"
+    - "here is my latest credit card statement"
+  finance.query:
+    - "how much did I spend on groceries last month?"
+    - "what's my total dining-out this year?"
+  finance.budget:
+    - "set my groceries budget to 600 a month"
+    - "what's my budget for restaurants?"
+  finance.subscription:
+    - "what subscriptions am I paying for?"
+    - "find my recurring charges"
 
 storage:
   type: jsonl
