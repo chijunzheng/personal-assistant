@@ -27,6 +27,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -34,12 +35,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
+from kernel import chat_log
 from kernel.audit import write_audit_entry
 from kernel.claude_runner import ClaudeResponse, ClaudeRunnerError, invoke as claude_invoke
 from kernel.classifier import Classifier, FALLBACK_INTENT
 from kernel.index import refresh as index_refresh_default
 from kernel.retrieval import gather_context
 from kernel.session import Session, load_or_create as session_load, update as session_update
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_LOCK_PATH",
@@ -72,6 +76,27 @@ _DEFAULT_INDEX_REFRESH_AFTER_WRITES = 5
 # (no prefix match) intentionally bypass the session update so failed
 # generations don't pollute active_session.md.
 _FITNESS_PLAN_SAVED_PREFIX = "Saved plan to fitness/plans/"
+
+
+def _compose_echo_prompt(*, message: str, recent: list) -> str:
+    """Prepend a verbatim "Recent conversation" preamble to the user's message.
+
+    Pure function so the echo-handler test can assert the composed prompt
+    without driving the whole orchestrator. ``recent`` is a list of
+    ``ChatTurn`` (chronological, newest last); when empty, the function
+    returns the message unchanged so the issue-#1 prompt shape is
+    preserved verbatim for fresh sessions.
+    """
+    if not recent:
+        return message
+
+    lines = ["## Recent conversation"]
+    for turn in recent:
+        lines.append(f"User: {turn.user_msg}")
+        lines.append(f"You: {turn.bot_reply}")
+    lines.append("")
+    lines.append(message)
+    return "\n".join(lines)
 
 
 class InstanceLockError(RuntimeError):
@@ -1337,13 +1362,37 @@ class Orchestrator:
         started_ts: datetime,
         wall_start: float,
     ) -> OrchestratorReply:
-        """Issue-#1 fallback: invoke the runner, log, return its text."""
+        """Issue-#1 fallback: invoke the runner, log, return its text.
+
+        Per ADR ``2026-05-10-chat-context-and-capabilities``, the echo
+        path loads the last 5 verbatim turns from ``kernel.chat_log`` and
+        prepends them to the LLM prompt as a "Recent conversation"
+        preamble — that's what lets *"yes, walk me through it"* resolve
+        to its antecedent. After dispatch (success OR error) the new
+        turn is appended to the log so the next turn sees it.
+
+        Issue #25 wires chat_log into the echo path only — structured
+        handlers gain the same wiring under #27.
+        """
+        # Load prior turns BEFORE the LLM call so they participate in
+        # the prompt. A failure here is non-fatal — degrade to a turn-
+        # local prompt rather than dropping the user's message.
+        try:
+            recent = chat_log.load_recent(
+                self._chat_id, n=5, vault_root=self._vault_root
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("chat_log load_recent failed (echo path); continuing")
+            recent = []
+
+        prompt = _compose_echo_prompt(message=message, recent=recent)
+
         outcome = "ok"
         error_message: Optional[str] = None
         response: Optional[ClaudeResponse] = None
 
         try:
-            response = self._invoker(message, system_prompt=self._system_prompt)
+            response = self._invoker(prompt, system_prompt=self._system_prompt)
         except ClaudeRunnerError as err:
             outcome = "error"
             error_message = str(err)
@@ -1366,16 +1415,42 @@ class Orchestrator:
 
         self._audit_writer(entry, audit_root=self._audit_root)
 
+        # Determine the user-facing reply text up front so we can both
+        # return it AND record it in the chat log. The error branch's
+        # friendly message *is* what the user sees; recording it lets
+        # the next turn see "I asked X, the bot apologized" as context
+        # rather than having no antecedent at all.
+        reply_text = (
+            response.text
+            if response is not None
+            else "Sorry — something went wrong handling that message."
+        )
+
+        # Append AFTER dispatch so the recorded turn carries the actual
+        # bot reply (or the friendly error). A chat-log failure must
+        # not break the user's reply path — log and continue.
+        try:
+            chat_log.append(
+                self._chat_id,
+                user_msg=message,
+                bot_reply=reply_text,
+                intent="",  # echo / fallback path — no routed intent
+                vault_root=self._vault_root,
+                clock=self._clock,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("chat_log append failed (echo path); continuing")
+
         if response is None:
             return OrchestratorReply(
-                text="Sorry — something went wrong handling that message.",
+                text=reply_text,
                 tokens_in=0,
                 tokens_out=0,
                 duration_ms=duration_ms,
             )
 
         return OrchestratorReply(
-            text=response.text,
+            text=reply_text,
             tokens_in=response.tokens_in,
             tokens_out=response.tokens_out,
             duration_ms=duration_ms,
