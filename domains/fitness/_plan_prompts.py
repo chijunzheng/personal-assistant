@@ -25,6 +25,24 @@ __all__ = [
 ]
 
 
+# Output contract appended to every plan-generation prompt. Vault notes are
+# durable artifacts — Jason re-reads them in Obsidian months later — so the
+# body must be clean Markdown with no preamble, no code fences, no emoji,
+# and no meta-commentary. Defense in depth: the kernel system prompt also
+# requires this, but constraining the per-task prompt makes the rule local.
+_OUTPUT_CONTRACT = (
+    "\n## Output contract (strict)\n"
+    "- Output ONLY the markdown body of the plan.\n"
+    "- Do NOT wrap the output in ``` fences of any kind.\n"
+    "- Do NOT include a preamble, an `★ Insight` block, a 'Learning-mode' "
+    "section, or any meta-commentary about how you made the plan.\n"
+    "- Do NOT use emoji. This is a durable Obsidian note, not a chat reply.\n"
+    "- First line MUST be the H1 title (e.g., `# Workout Plan — 2026-05-09`).\n"
+    "- The handler will prepend YAML frontmatter; do NOT output frontmatter "
+    "yourself.\n"
+)
+
+
 # ---------------------------------------------------------------------------
 # Slug + filename
 # ---------------------------------------------------------------------------
@@ -209,6 +227,7 @@ def build_workout_prompt(
         "filename. If recovery is poor (sleep <6h or journal mentions "
         "exhaustion/illness), recommend a moderate or recovery session "
         "instead of a max effort.\n"
+        + _OUTPUT_CONTRACT
     )
 
 
@@ -251,6 +270,7 @@ def build_nutrition_prompt(
         f"{target_kcal} kcal and at least {target_protein}g protein. Use ONLY "
         "items present in the inventory listing above. Strictly avoid any "
         f"foods that violate the dietary restrictions ({restrictions}).\n"
+        + _OUTPUT_CONTRACT
     )
 
 
