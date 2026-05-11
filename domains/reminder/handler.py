@@ -37,6 +37,8 @@ from kernel.claude_runner import ClaudeResponse, invoke as claude_invoke
 from kernel.session import Session
 from kernel.vault import atomic_write
 
+from domains.reminder import view as _view
+
 __all__ = [
     "ReminderWriteResult",
     "due_reminders",
@@ -48,6 +50,20 @@ __all__ = [
 
 # Path inside the vault.
 _EVENTS_RELATIVE = Path("reminder") / "events.jsonl"
+_VIEW_RELATIVE = Path("reminder") / "reminders.md"
+
+
+def _regenerate_view(vault_root: Path) -> None:
+    """Re-render ``reminders.md`` from the current events log.
+
+    Best-effort: the JSONL is canonical and has already landed before
+    this is invoked. Callers wrap this in try/except so any failure here
+    cannot roll back the source-of-truth append.
+    """
+    events_path = vault_root / _EVENTS_RELATIVE
+    view_path = vault_root / _VIEW_RELATIVE
+    body = _view.render(events_path, now=datetime.now(tz=timezone.utc))
+    atomic_write(view_path, body)
 
 _WRITE_INTENTS = ("reminder.add", "reminder.add_when", "reminder.cancel")
 _READ_INTENTS = ("reminder.list",)
@@ -400,6 +416,16 @@ def write(
     if event_row["id"] not in seen:
         _append_event(events_path, event_row)
         appended = True
+
+    # Re-project the Obsidian view (issue #32). JSONL is canonical, so view
+    # regeneration is best-effort — any failure must not roll back the append.
+    try:
+        _regenerate_view(Path(vault_root))
+    except Exception as exc:  # noqa: BLE001 — log + continue is the contract
+        print(
+            f"[reminder] view regeneration failed (jsonl is canonical): {exc}",
+            flush=True,
+        )
 
     return ReminderWriteResult(
         intent=intent,

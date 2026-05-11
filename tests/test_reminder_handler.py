@@ -546,3 +546,72 @@ def test_read_reminder_list_default_when_empty(tmp_path: Path) -> None:
         intent="reminder.list", query="what reminders do I have?", vault_root=vault_root
     )
     assert "no" in reply.lower() or "0" in reply
+
+
+# ---------------------------------------------------------------------------
+# Issue #32 — write() regenerates the Obsidian reminders.md projected view
+# ---------------------------------------------------------------------------
+
+
+def test_write_regenerates_obsidian_view(tmp_path: Path) -> None:
+    """After write(), vault/reminder/reminders.md exists with the new reminder."""
+    vault_root = tmp_path / "vault"
+
+    write(
+        intent="reminder.add",
+        message="remind me to order ikea hemnes for tracy",
+        session=_make_session(),
+        vault_root=vault_root,
+        clock=_fixed_clock,
+        extractor=_stub_extractor(
+            {
+                "message": "Order IKEA Hemnes for Tracy",
+                "fire_at": "2026-05-17T18:00:00+00:00",
+                "recurrence": None,
+            }
+        ),
+    )
+
+    view_path = vault_root / "reminder" / "reminders.md"
+    assert view_path.exists()
+    body = view_path.read_text(encoding="utf-8")
+    assert body.startswith("# Reminders\n")
+    assert "## Pending" in body
+    assert "- [ ] Order IKEA Hemnes for Tracy" in body
+    # JSONL still the source of truth — view is purely additive.
+    events_rows = _read_events(vault_root / "reminder" / "events.jsonl")
+    assert len(events_rows) == 1
+
+
+def test_view_render_failure_does_not_roll_back_jsonl(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If view regeneration raises, the JSONL append must still be intact."""
+    from domains.reminder import handler as handler_mod
+
+    vault_root = tmp_path / "vault"
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated view-render failure")
+
+    monkeypatch.setattr(handler_mod, "_regenerate_view", _boom)
+
+    result = write(
+        intent="reminder.add",
+        message="remind me Sunday at 6pm to call mom",
+        session=_make_session(),
+        vault_root=vault_root,
+        clock=_fixed_clock,
+        extractor=_stub_extractor(
+            {
+                "message": "call mom",
+                "fire_at": "2026-05-03T18:00:00+00:00",
+                "recurrence": None,
+            }
+        ),
+    )
+
+    assert result.appended is True
+    rows = _read_events(vault_root / "reminder" / "events.jsonl")
+    assert len(rows) == 1
+    assert rows[0]["message"] == "call mom"
