@@ -1601,6 +1601,13 @@ class Orchestrator:
             clock=self._clock,
         )
 
+        # Re-project the Obsidian view (ADR 2026-05-14). The events.jsonl
+        # is canonical; reminders.md is a generated projection. Driven
+        # unconditionally on a successful write — the reminder view
+        # tracks pending state, and rendering is best-effort, so a render
+        # failure can never roll back the append that already landed.
+        self._render_domain_view("reminder", started_ts=started_ts)
+
         if not appended:
             text = "Already on file — reminder unchanged."
         elif intent == "reminder.cancel":

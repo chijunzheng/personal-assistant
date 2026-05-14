@@ -50,6 +50,12 @@ handlers:
   write: handler.py:write
   read:  handler.py:read
 
+# Obsidian-viewable markdown projection (ADR 2026-05-14). Reminder is a
+# live-state domain — view.py projects events.jsonl to a single
+# vault/reminder/reminders.md. The kernel's post-write hook renders it.
+view:
+  module: view.py:render
+
 # This domain does NOT contribute to digests directly.
 # Instead, it has a dedicated cron job invoked by the kernel.
 digest:

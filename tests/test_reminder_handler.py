@@ -549,15 +549,25 @@ def test_read_reminder_list_default_when_empty(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Issue #32 — write() regenerates the Obsidian reminders.md projected view
+# Issue #38 — write() no longer self-renders the Obsidian view
+#
+# The reminder projection (issue #32) was retrofitted onto the kernel view
+# primitive (ADR 2026-05-14): the handler is now log-silent about the view,
+# and the kernel's ``_render_domain_view`` post-write hook drives rendering.
+# The kernel-called path is covered by tests/test_orchestrator_reminder_view.py.
 # ---------------------------------------------------------------------------
 
 
-def test_write_regenerates_obsidian_view(tmp_path: Path) -> None:
-    """After write(), vault/reminder/reminders.md exists with the new reminder."""
+def test_write_does_not_render_view_itself(tmp_path: Path) -> None:
+    """write() only touches canonical storage; reminders.md is the kernel's job.
+
+    The handler must not self-call the renderer — that responsibility
+    moved to the orchestrator's post-write hook in issue #38. So a bare
+    handler ``write()`` leaves no ``reminders.md`` behind.
+    """
     vault_root = tmp_path / "vault"
 
-    write(
+    result = write(
         intent="reminder.add",
         message="remind me to order ikea hemnes for tracy",
         session=_make_session(),
@@ -572,46 +582,19 @@ def test_write_regenerates_obsidian_view(tmp_path: Path) -> None:
         ),
     )
 
-    view_path = vault_root / "reminder" / "reminders.md"
-    assert view_path.exists()
-    body = view_path.read_text(encoding="utf-8")
-    assert body.startswith("# Reminders\n")
-    assert "## Pending" in body
-    assert "- [ ] Order IKEA Hemnes for Tracy" in body
-    # JSONL still the source of truth — view is purely additive.
+    # Canonical JSONL landed.
+    assert result.appended is True
     events_rows = _read_events(vault_root / "reminder" / "events.jsonl")
     assert len(events_rows) == 1
+    # The handler did not project the view — that is the kernel hook's job.
+    assert not (vault_root / "reminder" / "reminders.md").exists()
 
 
-def test_view_render_failure_does_not_roll_back_jsonl(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """If view regeneration raises, the JSONL append must still be intact."""
+def test_write_has_no_regenerate_view_symbol() -> None:
+    """The handler no longer exposes a ``_regenerate_view`` self-call hook.
+
+    Issue #38 removed the plugin-local render trigger; the kernel owns it.
+    """
     from domains.reminder import handler as handler_mod
 
-    vault_root = tmp_path / "vault"
-
-    def _boom(*_args, **_kwargs):
-        raise RuntimeError("simulated view-render failure")
-
-    monkeypatch.setattr(handler_mod, "_regenerate_view", _boom)
-
-    result = write(
-        intent="reminder.add",
-        message="remind me Sunday at 6pm to call mom",
-        session=_make_session(),
-        vault_root=vault_root,
-        clock=_fixed_clock,
-        extractor=_stub_extractor(
-            {
-                "message": "call mom",
-                "fire_at": "2026-05-03T18:00:00+00:00",
-                "recurrence": None,
-            }
-        ),
-    )
-
-    assert result.appended is True
-    rows = _read_events(vault_root / "reminder" / "events.jsonl")
-    assert len(rows) == 1
-    assert rows[0]["message"] == "call mom"
+    assert not hasattr(handler_mod, "_regenerate_view")
