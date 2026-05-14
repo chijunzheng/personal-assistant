@@ -211,9 +211,16 @@ Document any kernel change in `docs/decisions/<date>-<slug>.md` (an ADR).
 6. **Editing `configs/baseline.yaml` to "make the test pass"** — the baseline
    is *frozen* by design. If the eval fails, fix the engineering, not the
    baseline.
-7. **Writing markdown for structured data** — finance and inventory live in
-   `.jsonl` / `.yaml`, *not* prose markdown. Markdown is for narrative
-   (journal). Mixing these breaks query correctness.
+7. **Writing markdown for structured data as canonical storage** — finance
+   and inventory live in `.jsonl` / `.yaml`, *not* prose markdown. Markdown
+   is for narrative (journal). Mixing these breaks query correctness.
+   **Carve-out (ADR 2026-05-14):** a *generated* markdown view is permitted
+   and, for structured domains, required. It is a one-way projection of the
+   canonical `.jsonl`/`.yaml` — regenerated after every write, stamped with a
+   `generated_by:` frontmatter marker, and *never read back* by any query or
+   retrieval path. Canonical storage stays structured; the markdown is just
+   an Obsidian-viewable mirror (same category as `INDEX.md` or a digest).
+   What is still forbidden is making markdown the thing you *query against*.
 
 ---
 
