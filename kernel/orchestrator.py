@@ -44,6 +44,7 @@ from kernel.classifier import Classifier, FALLBACK_INTENT
 from kernel.index import refresh as index_refresh_default
 from kernel.retrieval import gather_context
 from kernel.session import Session, load_or_create as session_load, update as session_update
+from kernel.views import resolve_view_renderer
 
 logger = logging.getLogger(__name__)
 
@@ -846,6 +847,10 @@ class Orchestrator:
         # Bump the writes-since-refresh counter just like journal does — only
         # when at least one row genuinely landed on disk.
         if appended > 0:
+            # Re-project the Obsidian view (ADR 2026-05-14). The JSONL is
+            # canonical; the markdown rollups are a generated projection.
+            # Best-effort — a render failure can't roll back the append above.
+            self._render_domain_view("finance", started_ts=started_ts)
             self._maybe_refresh_index(started_ts=started_ts)
 
         if appended == 0 and skipped > 0:
@@ -1791,6 +1796,49 @@ class Orchestrator:
         if threshold is None:
             return _DEFAULT_INDEX_REFRESH_AFTER_WRITES
         return max(1, int(threshold))
+
+    def _render_domain_view(self, domain: str, *, started_ts: datetime) -> None:
+        """Render a domain's Obsidian markdown view after a successful write.
+
+        ADR 2026-05-14, change 2: the kernel resolves the domain's ``view:``
+        declaration data-drivenly (``kernel.views.resolve_view_renderer`` —
+        the kernel never names a domain), lazily imports the renderer, and
+        calls it with the uniform ``render(vault_root, *, now)`` signature.
+
+        Best-effort by contract: a renderer that raises is caught here and
+        audit-logged as ``op=view_render`` with ``outcome=error``. A render
+        failure can never roll back the canonical write that already
+        landed — it inherits the reminder plugin's existing contract.
+
+        Domains that declare no ``view:`` block resolve to ``None`` and this
+        method is a silent no-op for them (no audit entry, no work).
+        """
+        renderer = resolve_view_renderer(domain, domains_root=self._domains_root)
+        if renderer is None:
+            return
+
+        wall_start = time.monotonic()
+        outcome = "ok"
+        error_message: Optional[str] = None
+        try:
+            renderer(self._vault_root, now=self._clock())
+        except Exception as err:  # noqa: BLE001 — best-effort; never roll back
+            outcome = "error"
+            error_message = str(err)
+
+        duration_ms = int((time.monotonic() - wall_start) * 1000)
+        entry: dict[str, object] = {
+            "ts": started_ts.isoformat(),
+            "op": "view_render",
+            "actor": "kernel.orchestrator",
+            "domain": domain,
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            "config": self._config_label,
+        }
+        if error_message is not None:
+            entry["error"] = error_message
+        self._audit_writer(entry, audit_root=self._audit_root)
 
     def _maybe_refresh_index(self, *, started_ts: datetime) -> None:
         """Increment the write counter; refresh + audit-log + reset at threshold.

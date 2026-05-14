@@ -49,6 +49,13 @@ handlers:
   write: handler.py:write                          # idempotent on id
   read:  handler.py:read                           # structured query tool
 
+# Obsidian-viewable projection (ADR 2026-05-14). The kernel renders this
+# after every finance.transaction write — monthly rollup .md files under
+# vault/finance/, each carrying a generated_by: marker. The JSONL above
+# stays canonical; the markdown is generated and never read back.
+view:
+  module: view.py:render
+
 digest:
   enabled: true
   cadence: weekly                                  # spending breakdown in weekly digest
