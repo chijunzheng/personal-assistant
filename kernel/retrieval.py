@@ -165,6 +165,33 @@ def _read_text_safely(path: Path) -> str | None:
         return None
 
 
+# Frontmatter key stamped on every kernel-generated markdown file (INDEX.md,
+# and domain views per ADR 2026-05-14, change 5). Retrieval excludes marked
+# files from its read paths so a generated projection is never returned as
+# if it were a source note. A cheap prefix scan — the marker, when present,
+# lives in the leading frontmatter block.
+_GENERATED_MARKER_KEY = "generated_by"
+_GENERATED_MARKER_SCAN_LINES = 12
+
+
+def _is_generated_view(path: Path) -> bool:
+    """True if ``path`` is a kernel-generated markdown projection.
+
+    Detected by a top-level ``generated_by:`` line in the leading
+    frontmatter. Only the first handful of lines are scanned — the marker,
+    if present, is always near the top — so this stays cheap enough to call
+    per-candidate while walking the vault.
+    """
+    text = _read_text_safely(path)
+    if text is None:
+        return False
+    for raw in text.splitlines()[:_GENERATED_MARKER_SCAN_LINES]:
+        stripped = raw.strip()
+        if stripped.split(":", 1)[0].strip() == _GENERATED_MARKER_KEY:
+            return True
+    return False
+
+
 def _retrieval_section(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
     """Pull the ``retrieval`` sub-section from a config map, defaulting to {}."""
     if not config:
@@ -287,7 +314,12 @@ def _iter_domain_files(
     domain_dir = vault_root / domain
     if not domain_dir.exists():
         return ()
-    files = list(domain_dir.glob("*.md"))
+    # Exclude kernel-generated projections (ADR 2026-05-14, change 5): a
+    # generated monthly rollup must never surface as a grep hit alongside
+    # genuine source notes.
+    files = [
+        p for p in domain_dir.glob("*.md") if not _is_generated_view(p)
+    ]
     if recency_weighted:
         files.sort(
             key=lambda p: (_filename_date(p) or "", _safe_mtime(p), p.name),
@@ -424,8 +456,13 @@ def read_backlinks(
         return []
 
     # Pre-build a stem -> path map once so per-link resolution is O(1).
+    # Kernel-generated projections are excluded (ADR 2026-05-14, change 5):
+    # a ``[[wikilink]]`` must never resolve to a generated view, so a
+    # generated projection can never be read back as a source note.
     stem_to_paths: dict[str, list[Path]] = {}
     for candidate in root.rglob("*.md"):
+        if _is_generated_view(candidate):
+            continue
         stem_to_paths.setdefault(candidate.stem.lower(), []).append(candidate)
 
     visited: set[Path] = {seed.resolve()}

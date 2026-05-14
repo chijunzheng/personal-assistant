@@ -76,6 +76,11 @@ _WIKILINK_RE = re.compile(r"\[\[([^\[\]\|]+?)(?:\|[^\]]*)?\]\]")
 # Frontmatter delimiter — three dashes on a line by themselves.
 _FRONTMATTER_DELIM = "---"
 
+# Frontmatter key stamped on every kernel-generated markdown file (INDEX.md
+# itself, and domain views per ADR 2026-05-14). Files carrying it are walked
+# for their wikilinks but kept out of every eval-relevant section.
+_GENERATED_MARKER_KEY = "generated_by"
+
 # Stopwords we drop from filename tokens before clustering / frontier work.
 # Kept tiny on purpose — broader stopword lists belong to a v2 enhancement.
 _TOKEN_STOPWORDS = frozenset(
@@ -171,13 +176,22 @@ def write_scaffold(vault_root: str | os.PathLike[str]) -> Path:
 
 @dataclass(frozen=True)
 class _MarkdownNote:
-    """One parsed journal/markdown note."""
+    """One parsed journal/markdown note.
+
+    ``generated`` flags files carrying a ``generated_by:`` frontmatter
+    marker (kernel-generated projections — INDEX.md itself, domain views).
+    Generated notes are treated selectively (ADR 2026-05-14, change 5):
+    their ``wikilinks_out`` still feed the backlink graph, but they are
+    excluded from clusters / tag map / recent activity / domain stats /
+    orphans / vocabulary frontier / the indexed-file count.
+    """
 
     path: Path
     relative: str  # vault-relative POSIX path, deterministic
     tags: tuple[str, ...]
     wikilinks_out: tuple[str, ...]
     mtime: float
+    generated: bool = False
 
 
 def _is_under_skipped_dir(path: Path, vault_root: Path) -> bool:
@@ -254,6 +268,23 @@ def _split_inline_tags(inner: str) -> list[str]:
     return [piece.strip().strip("\"'") for piece in inner.split(",") if piece.strip()]
 
 
+def _has_generated_marker(front: str) -> bool:
+    """True if the frontmatter declares a ``generated_by:`` key.
+
+    Matches the marker ``kernel/index.py`` already stamps on its own output
+    and that domain views stamp on theirs — a top-level ``generated_by:``
+    line in the frontmatter block.
+    """
+    for raw in front.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key = stripped.split(":", 1)[0].strip()
+        if key == _GENERATED_MARKER_KEY:
+            return True
+    return False
+
+
 def _parse_wikilinks(body: str) -> tuple[str, ...]:
     """Extract ``[[wikilink-target]]`` references from a markdown body."""
     raw = _WIKILINK_RE.findall(body)
@@ -284,6 +315,7 @@ def _walk_markdown_notes(vault_root: Path) -> list[_MarkdownNote]:
         front, body = _split_frontmatter(text)
         tags = _parse_tags_from_frontmatter(front)
         links = _parse_wikilinks(body)
+        generated = _has_generated_marker(front)
         try:
             rel = path.relative_to(vault_root).as_posix()
         except ValueError:
@@ -295,6 +327,7 @@ def _walk_markdown_notes(vault_root: Path) -> list[_MarkdownNote]:
                 tags=tags,
                 wikilinks_out=links,
                 mtime=mtime,
+                generated=generated,
             )
         )
     return notes
@@ -492,26 +525,28 @@ def _build_domain_stats(
     return rows
 
 
-def _build_orphans(notes: list[_MarkdownNote]) -> list[str]:
-    """Notes with zero outbound and zero inbound wikilinks.
+def _build_orphans(
+    source_notes: list[_MarkdownNote],
+    *,
+    all_notes: list[_MarkdownNote],
+) -> list[str]:
+    """Source notes with zero outbound and zero inbound wikilinks.
 
-    Inbound is computed from the union of every other note's ``wikilinks_out``,
-    matched against the orphan candidate's filename stem (Obsidian's link
-    convention is by stem, not full path).
+    Inbound is computed from the union of *every* note's ``wikilinks_out`` —
+    including generated views (ADR 2026-05-14, change 5): a journal note
+    linked only by a generated finance rollup is rescued from the orphan
+    list, because the generated view's structural links feed the backlink
+    graph. Orphan *candidates*, however, are source notes only — a
+    generated view is never itself flagged as an orphan.
     """
-    by_stem: dict[str, _MarkdownNote] = {}
-    for note in notes:
-        stem = Path(note.relative).stem
-        by_stem.setdefault(stem, note)
-
     inbound: set[str] = set()
-    for note in notes:
+    for note in all_notes:
         for target in note.wikilinks_out:
             # ``[[some-page]]`` — match against bare stems.
             inbound.add(Path(target).stem)
 
     orphans: list[str] = []
-    for note in notes:
+    for note in source_notes:
         stem = Path(note.relative).stem
         has_out = bool(note.wikilinks_out)
         has_in = stem in inbound
@@ -695,6 +730,12 @@ def refresh(
     """
     root = Path(vault_root)
     notes = _walk_markdown_notes(root)
+    # Generated views (ADR 2026-05-14, change 5) are walked so their
+    # ``[[wikilinks]]`` can feed the backlink graph, but they are kept out
+    # of every eval-relevant section: clusters, tag map, recent activity,
+    # domain stats, the vocabulary frontier, and the indexed-file count.
+    # Only ``_build_orphans`` sees the full set (for inbound-link harvest).
+    source_notes = [n for n in notes if not n.generated]
 
     clock_fn = clock or (lambda: datetime.now(tz=timezone.utc))
     # Truncate to second granularity so wall-clock noise doesn't sneak into
@@ -702,16 +743,16 @@ def refresh(
     # returns the same value each call.
     generated_at = clock_fn().replace(microsecond=0).isoformat()
 
-    clusters = _build_topic_clusters(notes)
-    tag_map = _build_tag_map(notes)
-    recent = _build_recent_activity(notes, limit=_RECENT_LIMIT)
-    domain_stats = _build_domain_stats(root, notes)
-    orphans = _build_orphans(notes)
-    frontier = _build_vocabulary_frontier(notes)
+    clusters = _build_topic_clusters(source_notes)
+    tag_map = _build_tag_map(source_notes)
+    recent = _build_recent_activity(source_notes, limit=_RECENT_LIMIT)
+    domain_stats = _build_domain_stats(root, source_notes)
+    orphans = _build_orphans(source_notes, all_notes=notes)
+    frontier = _build_vocabulary_frontier(source_notes)
 
     body = _render_index(
         generated_at=generated_at,
-        files_indexed=len(notes),
+        files_indexed=len(source_notes),
         clusters=clusters,
         tag_map=tag_map,
         recent=recent,
@@ -725,7 +766,7 @@ def refresh(
 
     return RefreshResult(
         index_path=target,
-        files_indexed=len(notes),
+        files_indexed=len(source_notes),
         clusters=len(clusters),
         tags=len(tag_map),
         orphans=len(orphans),
